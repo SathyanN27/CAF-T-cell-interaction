@@ -1,0 +1,1755 @@
+import re
+from pathlib import Path
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy.spatial import cKDTree
+from scipy.stats import mannwhitneyu, kruskal
+from statsmodels.stats.multitest import multipletests
+
+import networkx as nx
+
+
+# -------------------- Style --------------------
+sns.set(style="whitegrid")
+plt.rcParams.update({
+    "savefig.bbox": "tight",
+    "axes.labelsize": 12,
+    "axes.titlesize": 14,
+    "legend.fontsize": 10,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10
+})
+
+
+# ===================== GLOBAL CONFIG =====================
+PIXEL_TO_MICRON = 0.325002431869506  # µm per pixel
+
+SURV_ORDER = ["Short", "Intermediate", "Long"]
+SURV_PALETTE = {"Short": "#4daf4a", "Intermediate": "#377eb8", "Long": "#e41a1c"}
+
+KD_WORKERS_ALL = True
+
+# Ripley parameters (µm)
+RIPLEY_R_UM = np.linspace(10, 150, 15)
+MIN_CENTRES_RIPLEY = 20
+
+# Stage 10 defaults (you requested 15NN)
+STAGE10_RADIUS_UM = 50
+STAGE10_KNN = 15
+STAGE10_UNDIRECTED = True
+STAGE10_NORMALIZE = True
+STAGE10_STATS_ON = "norm"  # "raw" or "norm"
+
+# Stage 11e safeguards
+STAGE11E_MAX_ROIS = 250
+STAGE11E_MIN_TUMOUR_CELLS = 20
+STAGE11E_MIN_NON_T_CELLS = 50
+
+
+# ===================== DETAILED PHENOTYPE SETUP =====================
+GROUP_ORDER_DETAILED = [
+    "CD4", "CD8", "B Cell", "APC", "Macrophage", "other immune",
+    "Subtype A", "Subtype B", "Subtype C", "Triple negative",
+    "Hypoxic", "Normoxic",
+    "Endothelial",
+    "Other",
+]
+
+IMMUNE_DETAILED = ["CD4", "CD8", "B Cell", "APC", "Macrophage", "other immune"]
+CAF_DETAILED    = ["Subtype A", "Subtype B", "Subtype C", "Triple negative"]
+TUMOUR_DETAILED = ["Hypoxic", "Normoxic"]
+
+CELL_TYPE_MAP = {
+    "CD4": "CD4 T cell",
+    "CD8": "CD8 T cell",
+    "B Cell": "B cell",
+    "Macrophage": "Macrophage",
+    "APC": "APC",
+    "other immune": "Other Immune",
+
+    "Subtype A": "CAF",
+    "Subtype B": "CAF",
+    "Subtype C": "CAF",
+    "Triple negative": "CAF",
+
+    "Hypoxic": "Tumour Hypoxia",
+    "Normoxic": "Tumour Normoxia",
+
+    "Endothelial": "Endothelial",
+    "Other": "Other",
+}
+
+CAT_COLORS = {
+    "CD4 T cell": "#a6cee3",
+    "CD8 T cell": "#1f78b4",
+    "B cell": "#b2df8a",
+    "Macrophage": "#33a02c",
+    "Other Immune": "#fb9a99",
+    "APC": "#e31a1c",
+    "CAF": "#ff7f00",
+    "Tumour Hypoxia": "#d62728",
+    "Tumour Normoxia": "#8c564b",
+    "Endothelial": "#cab2d6",
+    "Other": "#6a3d9a",
+}
+
+
+# ===================== UTILITIES =====================
+def ensure_dir(path) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def safe_name(x) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(x))
+
+def sanitize(x: str) -> str:
+    return str(x).replace("/", "_").replace(" ", "_").replace("(", "").replace(")", "").replace(":", "")
+
+def save_plot(path, dpi: int = 300) -> None:
+    plt.tight_layout()
+    plt.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+
+def savefig_both(fig: plt.Figure, out_base: Path) -> None:
+    fig.savefig(str(out_base) + ".png", dpi=300, bbox_inches="tight")
+    fig.savefig(str(out_base) + ".pdf", bbox_inches="tight")
+
+def ordered_subset(values, order_list):
+    values = [v for v in values if pd.notna(v)]
+    s = set(values)
+    ordered = [v for v in order_list if v in s]
+    tail = sorted([v for v in values if v not in set(ordered)])
+    return ordered + tail
+
+def canonicalize_detailed_pheno(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    s = " ".join(s.split())
+    low = s.lower()
+    if low in {"other immune", "other_immune", "otherimmune", "other-immune", "other immune "}:
+        return "other immune"
+    if low in {"b cell", "bcell", "b-cell"}:
+        return "B Cell"
+    if low in {"triple negative", "tripple negative", "triple_negative", "triple-negative"}:
+        return "Triple negative"
+    return s
+
+def _norm_core_id(x) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    try:
+        f = float(s)
+        if np.isfinite(f) and abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+    except Exception:
+        pass
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+def resolve_path(path_or_name: str, fallback_candidates=None) -> str:
+    tried = []
+    p = Path(path_or_name)
+    tried.append(str(p))
+    if p.exists():
+        return str(p)
+    if fallback_candidates:
+        for cand in fallback_candidates:
+            pc = Path(cand)
+            tried.append(str(pc))
+            if pc.exists():
+                print(f"[Path] Using fallback: {pc}")
+                return str(pc)
+    raise FileNotFoundError("Could not find input file. Tried:\n" + "\n".join(f"  - {t}" for t in tried))
+
+def tree_query(tree: cKDTree, pts: np.ndarray, k=1):
+    if KD_WORKERS_ALL:
+        try:
+            return tree.query(pts, k=k, workers=-1)
+        except TypeError:
+            pass
+    return tree.query(pts, k=k)
+
+def get_valid_um(df: pd.DataFrame) -> pd.DataFrame:
+    return df.dropna(subset=["X_um", "Y_um"]).copy()
+
+def get_cell_id_series(df: pd.DataFrame) -> pd.Series:
+    return df["CellID"] if "CellID" in df.columns else pd.Series(df.index.values, index=df.index)
+
+def _canon(s: str) -> str:
+    s = str(s).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+def find_column(df: pd.DataFrame, candidates):
+    can = {_canon(c): c for c in df.columns}
+    for cand in candidates:
+        k = _canon(cand)
+        if k in can:
+            return can[k]
+    return None
+
+def average_mats(mats):
+    acc = mats[0].copy()
+    for m in mats[1:]:
+        acc = acc.add(m, fill_value=0)
+    return acc / float(len(mats))
+
+def normalize_matrix(mat: pd.DataFrame) -> pd.DataFrame:
+    total = mat.values.sum()
+    return mat if total == 0 else mat / total
+
+def build_plot_order(values_in_data, preferred_order=None):
+    values_in_data = list(values_in_data)
+    if preferred_order is None:
+        return values_in_data
+    preferred = [v for v in preferred_order if v in values_in_data]
+    remaining = [v for v in values_in_data if v not in set(preferred)]
+    return preferred + remaining
+
+def sanity_report(phenotype_col, values_in_data, group_order, cell_type_map):
+    values_in_data = set(values_in_data)
+    if group_order is not None:
+        group_order = list(group_order)
+        missing_in_order = sorted([v for v in values_in_data if v not in set(group_order)])
+        extra_in_order = sorted([v for v in group_order if v not in values_in_data])
+        if extra_in_order:
+            print(f"[WARN] group_order has values not in {phenotype_col}: {extra_in_order}")
+        if missing_in_order:
+            print(f"[INFO] {phenotype_col} values not in group_order; appended: {missing_in_order}")
+    if cell_type_map is not None:
+        missing_in_map = sorted([v for v in values_in_data if v not in cell_type_map])
+        if missing_in_map:
+            print(f"[WARN] cell_type_map missing phenotypes (colored as Other): {missing_in_map}")
+
+def mannwhitney_safe(a, b):
+    a = pd.Series(a).dropna().values
+    b = pd.Series(b).dropna().values
+    if len(a) < 2 or len(b) < 2:
+        return np.nan
+    try:
+        return float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
+    except Exception:
+        return np.nan
+
+def kruskal_safe(groups_dict, order=SURV_ORDER):
+    vals = []
+    for k in order:
+        v = pd.Series(groups_dict.get(k, [])).dropna().values
+        if len(v) > 0:
+            vals.append(v)
+    if len(vals) < 2:
+        return np.nan
+    try:
+        return float(kruskal(*vals).pvalue)
+    except Exception:
+        return np.nan
+
+def core_to_patient_median(df: pd.DataFrame,
+                           value_cols,
+                           extra_group_cols=None,
+                           patient_col="Spot Id 1",
+                           core_col="Spot Id 2") -> pd.DataFrame:
+    """
+    Collapse core-level -> patient-level as:
+      per-core median (if multiple rows per core), then
+      patient median across cores.
+    """
+    if extra_group_cols is None:
+        extra_group_cols = []
+    if isinstance(value_cols, str):
+        value_cols = [value_cols]
+
+    df = df.copy()
+    df[patient_col] = df[patient_col].astype(str).str.strip()
+    df[core_col] = df[core_col].astype(str).str.strip()
+
+    grp_core = [patient_col, core_col] + list(extra_group_cols)
+    core_med = df.groupby(grp_core, as_index=False)[value_cols].median()
+
+    grp_pt = [patient_col] + list(extra_group_cols)
+    pt_med = core_med.groupby(grp_pt, as_index=False)[value_cols].median()
+
+    return pt_med
+
+
+# ===================== PLOTTING HELPERS (UNIFIED) =====================
+def plot_heatmap_df(
+    mat: pd.DataFrame,
+    outpath,
+    title: str,
+    order=None,
+    cmap="viridis",
+    figsize=(12, 10),
+    cbar_label=None,
+    annot: bool = False,
+    fmt: str = ".2f",
+    linewidths: float = 0.0,
+    triangle: bool = False,
+    triangle_side: str = "lower",  # lower or upper
+):
+    if order is not None:
+        order = [x for x in order if x in mat.index]
+        matp = mat.reindex(index=order, columns=order)
+    else:
+        matp = mat.copy()
+
+    mask = None
+    if triangle:
+        n = matp.shape[0]
+        if triangle_side == "lower":
+            mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        else:
+            mask = np.tril(np.ones((n, n), dtype=bool), k=-1)
+
+    plt.figure(figsize=figsize)
+    ax = sns.heatmap(
+        matp,
+        cmap=cmap,
+        square=True,
+        annot=annot,
+        fmt=fmt,
+        linewidths=linewidths,
+        mask=mask,
+        cbar_kws={"label": cbar_label} if cbar_label else None,
+    )
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+
+def plot_network_from_adjacency(
+    mat: pd.DataFrame,
+    outpath,
+    title: str,
+    order=None,
+    cell_type_map=None,
+    cat_colors=None,
+    seed: int = 0,
+):
+    matp = mat.copy()
+    if order is not None:
+        order = [x for x in order if x in matp.index]
+        matp = matp.reindex(index=order, columns=order).fillna(0)
+
+    G = nx.from_pandas_adjacency(matp)
+    G.remove_nodes_from(list(nx.isolates(G)))
+    if len(G) == 0:
+        return
+
+    weights = np.array([G[u][v]["weight"] for u, v in G.edges()], dtype=float)
+    if weights.size == 0:
+        return
+
+    scale = np.quantile(weights, 0.90)
+    scale = scale if (np.isfinite(scale) and scale > 0) else max(1.0, weights.max())
+    widths = np.clip(weights / scale, 0.2, 4.0).tolist()
+
+    pos = nx.spring_layout(G, k=0.5, seed=seed)
+
+    node_strengths = dict(G.degree(weight="weight"))
+    total_strength = sum(node_strengths.values())
+    prop = {n: (node_strengths[n] / total_strength if total_strength > 0 else 0) for n in G.nodes()}
+
+    node_colors = []
+    for n in G.nodes():
+        if cell_type_map is not None and cat_colors is not None:
+            broad = cell_type_map.get(n, "Other")
+            node_colors.append(cat_colors.get(broad, "#cccccc"))
+        else:
+            node_colors.append("#cccccc")
+
+    node_sizes = [300 + 9000 * prop[n] for n in G.nodes()]
+
+    plt.figure(figsize=(9, 9))
+    nx.draw(
+        G, pos,
+        with_labels=True,
+        node_color=node_colors,
+        node_size=node_sizes,
+        width=widths,
+        edge_color="grey",
+        font_size=8
+    )
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+
+def plot_violin_with_points(df: pd.DataFrame, x: str, y: str, outpath, title: str,
+                            order=None, palette=None, rotate: int = 90, point_size: float = 1.0, point_alpha: float = 0.25):
+    plt.figure(figsize=(12, 6))
+    sns.violinplot(data=df, x=x, y=y, order=order, palette=palette, inner=None)
+    sns.stripplot(data=df, x=x, y=y, order=order, color="k", size=point_size, alpha=point_alpha)
+    plt.xticks(rotation=rotate)
+    plt.title(title)
+    save_plot(outpath)
+
+def plot_box_with_points(df: pd.DataFrame, x: str, y: str, outpath, title: str,
+                         order=None, palette=None, rotate: int = 90, point_size: float = 3.0, point_alpha: float = 0.3):
+    plt.figure(figsize=(12, 6))
+    sns.boxplot(data=df, x=x, y=y, order=order, palette=palette)
+    sns.stripplot(data=df, x=x, y=y, order=order, color="k", size=point_size, alpha=point_alpha)
+    plt.xticks(rotation=rotate)
+    plt.title(title)
+    save_plot(outpath)
+
+
+# ===================== CLINICAL PREPROCESS =====================
+def preprocess_clinical(clin: pd.DataFrame) -> pd.DataFrame:
+    df = clin.copy()
+
+    pt_col = find_column(df, ["Spot Id 1", "SpotId1", "Donor ID", "DonorID", "Patient", "PatientID"])
+    if pt_col is None:
+        raise ValueError(f"Could not find patient ID column in clinical. Seen: {list(df.columns)}")
+    if pt_col != "Spot Id 1":
+        df = df.rename(columns={pt_col: "Spot Id 1"})
+
+    os_col = find_column(df, ["Overall_Survival_(days)", "Overall Survival (days)", "OverallSurvivalDays",
+                              "OS_days", "OSDays", "SurvivalDays"])
+    if os_col is None:
+        raise ValueError(f"Could not find OS days column in clinical. Seen: {list(df.columns)}")
+    if os_col != "SurvivalDays":
+        df = df.rename(columns={os_col: "SurvivalDays"})
+
+    fu_col = find_column(df, ["Follow_up", "Follow up", "Followup", "FollowUp"])
+
+    df["Spot Id 1"] = df["Spot Id 1"].astype(str).str.strip()
+    df = df[~df["SurvivalDays"].astype(str).str.contains("lost to follow up", case=False, na=False)].copy()
+
+    if fu_col is not None:
+        mask = df["SurvivalDays"].astype(str).str.strip().isin(["NA", "N/A", "nan", "None", ""])
+        df.loc[mask, "SurvivalDays"] = df.loc[mask, fu_col]
+
+    df["SurvivalDays"] = pd.to_numeric(df["SurvivalDays"], errors="coerce")
+    df["SurvivalCategory"] = pd.cut(df["SurvivalDays"], bins=[-np.inf, 540, 900, np.inf], labels=SURV_ORDER)
+    df["SurvivalCategory"] = pd.Categorical(df["SurvivalCategory"], categories=SURV_ORDER, ordered=True)
+
+    df = df[["Spot Id 1", "SurvivalDays", "SurvivalCategory"]].drop_duplicates()
+
+    dup = df.duplicated(subset=["Spot Id 1"], keep=False)
+    if dup.any():
+        offenders = df.loc[dup, "Spot Id 1"].value_counts()
+        raise ValueError("Clinical file has multiple rows for some patients:\n" + offenders.to_string())
+
+    return df
+
+
+# ===================== AREA LOOKUP (mm² -> µm²) =====================
+def find_area_cols(area_df: pd.DataFrame) -> dict:
+    cols = list(area_df.columns)
+    ccanon = {c: _canon(c) for c in cols}
+
+    def pick(kind_words):
+        hits = []
+        for c in cols:
+            s = ccanon[c]
+            if "area" in s and any(w in s for w in kind_words):
+                hits.append(c)
+        return hits[0] if hits else None
+
+    total = pick(["total"]) or pick(["tissue"])
+    tumour = pick(["tumour", "tumor"])
+    immune = pick(["immune"])
+    stroma = pick(["stroma"])
+    return {"total": total, "tumour": tumour, "immune": immune, "stroma": stroma}
+
+def build_area_lookup_um2(area_df: pd.DataFrame) -> dict:
+    if area_df is None or area_df.empty:
+        return {}
+
+    df = area_df.copy()
+    if "Spot Id 1" not in df.columns or "Spot Id 2" not in df.columns:
+        return {}
+
+    df["Spot Id 1"] = df["Spot Id 1"].astype(str).str.strip()
+    df["Spot Id 2"] = df["Spot Id 2"].apply(_norm_core_id)
+
+    cols = find_area_cols(df)
+    cols = {k: v for k, v in cols.items() if v is not None and v in df.columns}
+    if not cols:
+        return {}
+
+    for _, c in cols.items():
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=list(cols.values()), how="all").copy()
+    if df.empty:
+        return {}
+
+    for k, c in cols.items():
+        df[f"Area_um2_{k}"] = df[c].astype(float) * 1e6
+
+    agg_cols = [f"Area_um2_{k}" for k in cols.keys()]
+    g = df.groupby(["Spot Id 1", "Spot Id 2"], as_index=False)[agg_cols].median()
+
+    lookup = {}
+    for _, r in g.iterrows():
+        key = (r["Spot Id 1"], r["Spot Id 2"])
+        d = {}
+        for k in cols.keys():
+            v = float(r[f"Area_um2_{k}"])
+            if np.isfinite(v) and v > 0:
+                d[k] = v
+        if d:
+            lookup[key] = d
+    return lookup
+
+def get_area_um2(area_lookup: dict, pat: str, core: str, kind: str, fallback_um2: float) -> float:
+    d = area_lookup.get((str(pat).strip(), _norm_core_id(core)), None)
+    if isinstance(d, dict):
+        v = d.get(kind, None)
+        if v is not None and v > 0:
+            return float(v)
+    return float(fallback_um2)
+
+
+# ===================== DATA LOADING (µm columns created ONCE) =====================
+def load_data(final_csv: str, area_csv: str, clin_csv: str):
+    final_csv = resolve_path(final_csv, fallback_candidates=[
+        "/data/home/hfx986/Combat/Final_Cell_Phenotypes.csv",
+        "/data/home/hfx986/Final_Cell_Phenotypes.csv",
+    ])
+    area_csv = resolve_path(area_csv, fallback_candidates=[
+        "/data/home/hfx986/Area.csv",
+        "/data/home/hfx986/Combat/Area.csv",
+    ])
+    clin_csv = resolve_path(clin_csv, fallback_candidates=[
+        "/data/home/hfx986/Clinical_Data.csv",
+        "/data/home/hfx986/Combat/Clinical_Data.csv",
+    ])
+
+    print(f"[Input] final_csv: {final_csv}")
+    print(f"[Input] area_csv : {area_csv}")
+    print(f"[Input] clin_csv : {clin_csv}")
+
+    final = pd.read_csv(final_csv)
+    area = pd.read_csv(area_csv)
+    clin = pd.read_csv(clin_csv)
+
+    req = ["Spot Id 1", "Spot Id 2", "X", "Y", "Main_Cell_Type", "Detailed_Phenotype"]
+    miss = [c for c in req if c not in final.columns]
+    if miss:
+        raise ValueError(f"Final CSV missing columns: {miss}")
+
+    final["Spot Id 1"] = final["Spot Id 1"].astype(str).str.strip()
+    final["Spot Id 2"] = final["Spot Id 2"].apply(_norm_core_id)
+    final["Main_Cell_Type"] = final["Main_Cell_Type"].astype(str).str.strip()
+    final["Detailed_Phenotype"] = final["Detailed_Phenotype"].apply(canonicalize_detailed_pheno)
+
+    final["X_um"] = pd.to_numeric(final["X"], errors="coerce") * PIXEL_TO_MICRON
+    final["Y_um"] = pd.to_numeric(final["Y"], errors="coerce") * PIXEL_TO_MICRON
+
+    if "CellID" not in final.columns:
+        final["CellID"] = np.arange(len(final), dtype=int)
+
+    clinical = preprocess_clinical(clin)
+
+    if "Spot Id 1" in area.columns:
+        area["Spot Id 1"] = area["Spot Id 1"].astype(str).str.strip()
+    if "Spot Id 2" in area.columns:
+        area["Spot Id 2"] = area["Spot Id 2"].apply(_norm_core_id)
+
+    area_lookup = build_area_lookup_um2(area)
+    if area_lookup:
+        print(f"[Area] Built area lookup for {len(area_lookup)} (patient,core) entries.")
+        print(f"[Area] Detected columns: {find_area_cols(area)}")
+    else:
+        print("[Area] WARNING: Could not build area lookup (Ripley will fall back to bbox area).")
+
+    return final, area, clinical, area_lookup
+
+
+# ===================== STATS HELPERS =====================
+def stats_by_group(df: pd.DataFrame, group_col: str, value_col: str, output_dir, output_prefix: str) -> pd.DataFrame:
+    ensure_dir(output_dir)
+    df = df[[group_col, value_col]].dropna().copy()
+
+    if df.empty or df[value_col].nunique() <= 1:
+        out = pd.DataFrame([{"Test": "NA", "stat": np.nan, "p": np.nan, "group1": "-", "group2": "-"}])
+        out.to_csv(Path(output_dir) / f"{output_prefix}_stats.csv", index=False)
+        return out
+
+    group_names = sorted(df[group_col].dropna().unique().tolist())
+    groups = [df[df[group_col] == g][value_col].values for g in group_names]
+
+    stat_table = []
+    if sum((len(g) > 1) for g in groups) >= 3:
+        try:
+            kw_stat, kw_p = kruskal(*groups, nan_policy="omit")
+        except Exception:
+            kw_stat, kw_p = np.nan, np.nan
+        stat_table.append({"Test": "Kruskal–Wallis", "stat": kw_stat, "p": kw_p, "group1": "all", "group2": "all"})
+
+    mw_stats = []
+    for a, b in combinations(group_names, 2):
+        xa = df[df[group_col] == a][value_col].dropna().values
+        xb = df[df[group_col] == b][value_col].dropna().values
+        if len(xa) < 2 or len(xb) < 2:
+            mw_stats.append({"Test": "Mann–Whitney", "stat": np.nan, "p": np.nan, "group1": a, "group2": b})
+            continue
+        if (np.all(xa == xa[0]) and np.all(xb == xb[0])):
+            mw_stats.append({"Test": "Mann–Whitney", "stat": np.nan, "p": np.nan, "group1": a, "group2": b})
+            continue
+        try:
+            u, p = mannwhitneyu(xa, xb, alternative="two-sided")
+        except Exception:
+            u, p = np.nan, np.nan
+        mw_stats.append({"Test": "Mann–Whitney", "stat": u, "p": p, "group1": a, "group2": b})
+
+    pvals = [d["p"] for d in mw_stats if d["p"] == d["p"]]
+    if pvals:
+        _, fdr, _, _ = multipletests(pvals, method="fdr_bh")
+        j = 0
+        for d in mw_stats:
+            if d["p"] == d["p"]:
+                d["FDR_p"] = fdr[j]
+                j += 1
+            else:
+                d["FDR_p"] = np.nan
+
+    stat_df = pd.DataFrame(stat_table + mw_stats)
+    stat_df.to_csv(Path(output_dir) / f"{output_prefix}_stats.csv", index=False)
+    return stat_df
+
+
+# ===================== STAGE 10 (µm-native) =====================
+def stage10_hybrid_interaction_maps_um(
+    final_data: pd.DataFrame,
+    clinical_df: pd.DataFrame,
+    outdir,
+    phenotype_col: str = "Detailed_Phenotype",
+    radius_um: float = 50,
+    k_nn: int = 15,
+    group_order=None,
+    cell_type_map=None,
+    cat_colors=None,
+    normalize: bool = True,
+    undirected: bool = True,
+    stats_on: str = "norm",
+):
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+
+    required = {"Spot Id 1", "Spot Id 2", "X_um", "Y_um", phenotype_col}
+    miss = required - set(final_data.columns)
+    if miss:
+        raise ValueError(f"final_data missing required columns: {sorted(miss)}")
+
+    phenos_in_data = sorted(final_data[phenotype_col].dropna().unique())
+    if not phenos_in_data:
+        print("[Stage10] No phenotypes found.")
+        return
+
+    plot_order = build_plot_order(phenos_in_data, group_order)
+    sanity_report(phenotype_col, phenos_in_data, group_order, cell_type_map)
+
+    ph_to_idx = {ph: i for i, ph in enumerate(phenos_in_data)}
+    P = len(phenos_in_data)
+
+    roi_mats_raw, roi_mats_norm, roi_qc_rows = {}, {}, []
+
+    for roi, sub in final_data.groupby("Spot Id 2"):
+        sub = sub.dropna(subset=["X_um", "Y_um", phenotype_col]).reset_index(drop=True)
+        n = len(sub)
+        if n < 2:
+            continue
+
+        coords = sub[["X_um", "Y_um"]].to_numpy(dtype=float)
+        tree = cKDTree(coords)
+
+        k_query = min(k_nn + 1, n)
+        dists, nbrs = tree_query(tree, coords, k=k_query)
+        if k_query <= 1:
+            continue
+
+        i_idx = np.repeat(np.arange(n), k_query - 1)
+        j_idx = nbrs[:, 1:].reshape(-1)
+        d_flat = dists[:, 1:].reshape(-1)
+
+        m = d_flat <= float(radius_um)
+        i_idx = i_idx[m]
+        j_idx = j_idx[m]
+
+        if i_idx.size == 0:
+            mat_raw = pd.DataFrame(0.0, index=phenos_in_data, columns=phenos_in_data)
+            roi_mats_raw[roi] = mat_raw
+            roi_mats_norm[roi] = normalize_matrix(mat_raw) if normalize else mat_raw
+            roi_qc_rows.append({"Spot Id 2": roi, "n_cells": n, "n_relations_kept": 0, "n_unique_edges": 0, "total_matrix_sum": 0.0})
+            continue
+
+        if undirected:
+            a = np.minimum(i_idx, j_idx)
+            b = np.maximum(i_idx, j_idx)
+            edges = np.unique(np.stack([a, b], axis=1), axis=0)
+            ia, ib = edges[:, 0], edges[:, 1]
+        else:
+            ia, ib = i_idx, j_idx
+
+        ph_codes = sub[phenotype_col].map(ph_to_idx).to_numpy()
+        pha, phb = ph_codes[ia], ph_codes[ib]
+
+        mat_np = np.zeros((P, P), dtype=float)
+        np.add.at(mat_np, (pha, phb), 1.0)
+        if undirected:
+            off = pha != phb
+            np.add.at(mat_np, (phb[off], pha[off]), 1.0)
+
+        mat_raw = pd.DataFrame(mat_np, index=phenos_in_data, columns=phenos_in_data)
+        mat_norm = normalize_matrix(mat_raw) if normalize else mat_raw
+
+        roi_mats_raw[roi] = mat_raw
+        roi_mats_norm[roi] = mat_norm
+        roi_qc_rows.append({
+            "Spot Id 2": roi,
+            "n_cells": n,
+            "n_relations_kept": int(i_idx.size),
+            "n_unique_edges": int(len(ia)) if undirected else int(i_idx.size),
+            "total_matrix_sum": float(mat_raw.values.sum()),
+        })
+
+    if not roi_mats_raw:
+        print("[Stage10] No interaction matrices computed.")
+        return
+
+    pd.DataFrame(roi_qc_rows).sort_values(["n_cells", "n_unique_edges"], ascending=False).to_csv(outdir / "ROI_QC.csv", index=False)
+
+    totals_raw = {roi: m.values.sum() for roi, m in roi_mats_raw.items()}
+    median_total = np.median(list(totals_raw.values()))
+    rep_roi = min(totals_raw, key=lambda r: abs(totals_raw[r] - median_total))
+    rep_raw = roi_mats_raw[rep_roi]
+    rep_norm = roi_mats_norm[rep_roi]
+
+    # Representative plots: TRIANGLE + coolwarm (match your correlation triangle request)
+    plot_heatmap_df(rep_raw,  outdir / f"Representative_Heatmap_RAW_{rep_roi}.png",
+                    title=f"Representative Heatmap (RAW) — ROI {rep_roi} ({phenotype_col})",
+                    order=plot_order, cmap="coolwarm", cbar_label="Contact count", figsize=(12, 10),
+                    triangle=True, triangle_side="lower")
+
+    plot_heatmap_df(rep_norm, outdir / f"Representative_Heatmap_NORM_{rep_roi}.png",
+                    title=f"Representative Heatmap (NORM) — ROI {rep_roi} ({phenotype_col})",
+                    order=plot_order, cmap="coolwarm", cbar_label="Proportion", figsize=(12, 10),
+                    triangle=True, triangle_side="lower")
+
+    plot_network_from_adjacency(rep_norm, outdir / f"Representative_Network_NORM_{rep_roi}.png",
+                                title=f"Representative Network (NORM) — ROI {rep_roi} ({phenotype_col})",
+                                order=plot_order, cell_type_map=cell_type_map, cat_colors=cat_colors)
+
+    # patient averaging (ROI-equal weights)
+    roi2pt = final_data.groupby("Spot Id 2")["Spot Id 1"].agg(lambda x: x.mode().iat[0] if not x.mode().empty else x.iloc[0]).to_dict()
+    pt_raw_list, pt_norm_list = {}, {}
+    for roi in roi_mats_raw.keys():
+        pt = roi2pt.get(roi)
+        if pd.notna(pt):
+            pt_raw_list.setdefault(pt, []).append(roi_mats_raw[roi])
+            pt_norm_list.setdefault(pt, []).append(roi_mats_norm[roi])
+
+    pt_raw = {pt: average_mats(mats) for pt, mats in pt_raw_list.items()}
+    pt_norm = {pt: average_mats(mats) for pt, mats in pt_norm_list.items()}
+
+    pd.DataFrame([{"Spot Id 1": pt, "n_rois": len(pt_raw_list[pt])} for pt in pt_raw_list]) \
+      .sort_values("n_rois", ascending=False).to_csv(outdir / "Patient_QC.csv", index=False)
+
+    # survival stratified averages (patient-level)
+    pt2surv = clinical_df.set_index("Spot Id 1")["SurvivalCategory"].to_dict()
+    strat_raw = {k: [] for k in SURV_ORDER}
+    strat_norm = {k: [] for k in SURV_ORDER}
+
+    for pt in pt_raw.keys():
+        cat = pt2surv.get(pt)
+        if pd.notna(cat):
+            strat_raw[str(cat)].append(pt_raw[pt])
+            strat_norm[str(cat)].append(pt_norm[pt])
+
+    strat_avg_raw = {cat: (average_mats(mats) if mats else pd.DataFrame(0.0, index=phenos_in_data, columns=phenos_in_data))
+                     for cat, mats in strat_raw.items()}
+    strat_avg_norm = {cat: (average_mats(mats) if mats else pd.DataFrame(0.0, index=phenos_in_data, columns=phenos_in_data))
+                      for cat, mats in strat_norm.items()}
+
+    for cat in SURV_ORDER:
+        plot_heatmap_df(strat_avg_raw[cat], outdir / f"Heatmap_RAW_{cat}.png",
+                        title=f"Heatmap (RAW) — {cat} Survival Avg ({phenotype_col})",
+                        order=plot_order, cmap="coolwarm", cbar_label="Contact count", figsize=(12, 10),
+                        triangle=True, triangle_side="lower")
+
+        plot_heatmap_df(strat_avg_norm[cat], outdir / f"Heatmap_NORM_{cat}.png",
+                        title=f"Heatmap (NORM) — {cat} Survival Avg ({phenotype_col})",
+                        order=plot_order, cmap="coolwarm", cbar_label="Proportion", figsize=(12, 10),
+                        triangle=True, triangle_side="lower")
+
+        plot_network_from_adjacency(strat_avg_norm[cat], outdir / f"Network_NORM_{cat}.png",
+                                    title=f"Network (NORM) — {cat} Survival Avg ({phenotype_col})",
+                                    order=plot_order, cell_type_map=cell_type_map, cat_colors=cat_colors)
+
+    # stats (patient-level matrices)
+    strat_for_stats = strat_norm if stats_on == "norm" else strat_raw
+    results = []
+    for i, ph1 in enumerate(phenos_in_data):
+        for j, ph2 in enumerate(phenos_in_data):
+            if j < i:
+                continue
+            data = []
+            for cat in SURV_ORDER:
+                vals = [m.at[ph1, ph2] for m in strat_for_stats[cat] if (ph1 in m.index and ph2 in m.columns)]
+                data.append(vals)
+            if all(len(d) > 1 for d in data):
+                _, p = kruskal(*data)
+                results.append({"Pheno1": ph1, "Pheno2": ph2, "KW_p": p, "StatsOn": stats_on})
+
+    df_stats = pd.DataFrame(results)
+    if not df_stats.empty:
+        df_stats["KW_p_FDR"] = multipletests(df_stats["KW_p"], method="fdr_bh")[1]
+        df_stats.to_csv(outdir / "Interaction_Survival_Stats.csv", index=False)
+
+    pd.Series(phenos_in_data, name=f"Unique_{phenotype_col}").to_csv(outdir / f"Unique_{phenotype_col}.csv", index=False)
+    print(f"[DONE] Stage10 complete (µm-native). Outputs: {outdir}")
+
+
+# ===================== STAGE 11 (µm-native NN + maps) =====================
+def stage11c_nn_per_cell_detailed_um(final_data, outdir, group_order_detailed):
+    out = Path(outdir) / "Stage11c_NN_Distances_Per_Cell_DETAILED_um"
+    ensure_dir(out)
+
+    df = get_valid_um(final_data)
+
+    available = set(df["Detailed_Phenotype"].dropna().astype(str).unique())
+    phenos = [p for p in group_order_detailed if p in available] or sorted(list(available))
+    palette = dict(zip(phenos, sns.color_palette("tab20", len(phenos))))
+
+    rows = []
+    for roi, sub in df.groupby("Spot Id 2"):
+        tum = sub[sub["Main_Cell_Type"] == "Tumour"]
+        if tum.empty:
+            continue
+        tree = cKDTree(tum[["X_um", "Y_um"]].values)
+
+        for ph in phenos:
+            cells = sub[sub["Detailed_Phenotype"].astype(str) == ph]
+            if cells.empty:
+                continue
+            d_um, _ = tree_query(tree, cells[["X_um", "Y_um"]].values, k=1)
+
+            ids = get_cell_id_series(cells).values
+            pids = cells["Spot Id 1"].values
+
+            rows.extend(
+                {"Spot Id 2": roi, "Spot Id 1": pid, "CellID": cid, "Phenotype": ph, "NN_Distance_um": float(dist)}
+                for cid, dist, pid in zip(ids, d_um, pids)
+            )
+
+    dist_df = pd.DataFrame(rows)
+    dist_df.to_csv(out / "NN_PerCell_DETAILED_um.csv", index=False)
+
+    if dist_df.empty:
+        print("[Stage11c] No NN distances computed.")
+        return dist_df, phenos, palette
+
+    plot_violin_with_points(
+        dist_df, x="Phenotype", y="NN_Distance_um",
+        outpath=out / "Violin_PerCell_DETAILED_um.png",
+        title="NN distance to Tumour (per-cell, µm) by Detailed_Phenotype",
+        order=phenos, palette=palette, rotate=90, point_size=1, point_alpha=0.25
+    )
+
+    plot_box_with_points(
+        dist_df, x="Phenotype", y="NN_Distance_um",
+        outpath=out / "Boxplot_PerCell_DETAILED_um.png",
+        title="NN distance to Tumour (per-cell, µm) by Detailed_Phenotype",
+        order=phenos, palette=palette, rotate=90, point_size=2.5, point_alpha=0.2
+    )
+
+    return dist_df, phenos, palette
+
+def stage11d_nn_median_per_patient_detailed_um(final_data, outdir, phenos, palette):
+    outdir = Path(outdir) / "Stage11d_NN_MedianPerPatient_DETAILED_um"
+    ensure_dir(outdir)
+
+    df = get_valid_um(final_data)
+
+    rows = []
+    for roi, sub in df.groupby("Spot Id 2"):
+        tum = sub[sub["Main_Cell_Type"] == "Tumour"]
+        if tum.empty:
+            continue
+        tree = cKDTree(tum[["X_um", "Y_um"]].values)
+
+        for ph in phenos:
+            oth = sub[sub["Detailed_Phenotype"].astype(str) == ph]
+            if oth.empty:
+                continue
+            d_um, _ = tree_query(tree, oth[["X_um", "Y_um"]].values, k=1)
+            med = pd.DataFrame({"Spot Id 1": oth["Spot Id 1"].values, "Spot Id 2": roi, "D_um": d_um})
+            med = med.groupby(["Spot Id 1", "Spot Id 2"], as_index=False)["D_um"].median()
+
+            rows += [{
+                "Spot Id 1": pid,
+                "Spot Id 2": roi_id,
+                "Phenotype": ph,
+                "MedianDist_um": float(md)
+            } for pid, roi_id, md in zip(med["Spot Id 1"], med["Spot Id 2"], med["D_um"])]
+
+    df_core = pd.DataFrame(rows)
+    df_core.to_csv(outdir / "NN_MedianPerPatientPerTMA_DETAILED_um.csv", index=False)
+
+    if df_core.empty:
+        print("[Stage11d] No patient medians computed.")
+        return df_core
+
+    df_pt = df_core.groupby(["Spot Id 1", "Phenotype"], as_index=False)["MedianDist_um"].median()
+    df_pt.to_csv(outdir / "NN_MedianPerPatient_DETAILED_um.csv", index=False)
+
+    plot_box_with_points(
+        df_pt, x="Phenotype", y="MedianDist_um",
+        outpath=outdir / "Boxplot_MedianPerPatient_DETAILED_um.png",
+        title="Median NN distance to Tumour (per patient, µm) by Detailed_Phenotype",
+        order=phenos, palette=palette, rotate=90, point_size=2.5, point_alpha=0.25
+    )
+
+    pivot = df_pt.groupby(["Spot Id 1", "Phenotype"])["MedianDist_um"].median().unstack().reindex(columns=phenos)
+    plot_heatmap_df(
+        pivot, outdir / "Heatmap_MedianPerPatient_DETAILED_um.png",
+        title="Median NN distance to Tumour (per patient, µm) – Detailed_Phenotype",
+        order=None, cmap="viridis", figsize=(10, 8), cbar_label=None, annot=False, linewidths=0.5
+    )
+
+    return df_pt
+
+def stage11f_survival_stratified_nn_detailed_um(final_data, dist_df, med_df, clinical, outdir, phenos):
+    out = Path(outdir) / "Stage11f_SurvivalStratified_DETAILED_um"
+    ensure_dir(out)
+
+    if dist_df.empty or med_df.empty:
+        print("[Stage11f] dist_df or med_df empty, skipping.")
+        return
+
+    cell = dist_df.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+    pt = med_df.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+
+    stats = []
+    for ph in phenos:
+        sub = pt[pt["Phenotype"] == ph].dropna(subset=["SurvivalCategory", "MedianDist_um"]).copy()
+        grp = sub.groupby("SurvivalCategory")["MedianDist_um"].apply(list).to_dict()
+        row = {"Phenotype": ph}
+        row["Short_vs_Intermediate_p"] = mannwhitney_safe(grp.get("Short", []), grp.get("Intermediate", []))
+        row["Short_vs_Long_p"] = mannwhitney_safe(grp.get("Short", []), grp.get("Long", []))
+        row["Intermediate_vs_Long_p"] = mannwhitney_safe(grp.get("Intermediate", []), grp.get("Long", []))
+        row["KW_p"] = kruskal_safe(grp)
+        stats.append(row)
+
+    stats_df = pd.DataFrame(stats)
+    for col in ["Short_vs_Intermediate_p", "Short_vs_Long_p", "Intermediate_vs_Long_p", "KW_p"]:
+        p = stats_df[col].values
+        mask = np.isfinite(p)
+        if mask.sum() > 0:
+            stats_df[col.replace("_p", "_p_FDR")] = np.nan
+            stats_df.loc[mask, col.replace("_p", "_p_FDR")] = multipletests(p[mask], method="fdr_bh")[1]
+    stats_df.to_csv(out / "Survival_NN_Stats_DETAILED_um.csv", index=False)
+
+    for ph in phenos:
+        sub_cell = cell[cell["Phenotype"] == ph].dropna(subset=["SurvivalCategory", "NN_Distance_um"])
+        sub_pt = pt[pt["Phenotype"] == ph].dropna(subset=["SurvivalCategory", "MedianDist_um"])
+        if sub_cell.empty and sub_pt.empty:
+            continue
+
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+        if not sub_cell.empty:
+            sns.boxplot(
+                x="SurvivalCategory", y="NN_Distance_um",
+                data=sub_cell, order=SURV_ORDER, palette=SURV_PALETTE, ax=ax[0]
+            )
+            sns.stripplot(
+                x="SurvivalCategory", y="NN_Distance_um",
+                data=sub_cell, order=SURV_ORDER, color="k", size=2, alpha=0.2, ax=ax[0]
+            )
+        ax[0].set_title(f"{ph}: per-cell (µm)")
+        ax[0].tick_params(axis="x", rotation=90)
+
+        if not sub_pt.empty:
+            sns.boxplot(
+                x="SurvivalCategory", y="MedianDist_um",
+                data=sub_pt, order=SURV_ORDER, palette=SURV_PALETTE, ax=ax[1]
+            )
+            sns.stripplot(
+                x="SurvivalCategory", y="MedianDist_um",
+                data=sub_pt, order=SURV_ORDER, color="k", size=3, alpha=0.25, ax=ax[1]
+            )
+        ax[1].set_title(f"{ph}: per-patient median (µm)")
+        ax[1].tick_params(axis="x", rotation=90)
+
+        plt.tight_layout()
+        plt.savefig(out / f"{safe_name(ph)}.png", dpi=300, bbox_inches="tight")
+        plt.close()
+
+def stage11e_spatial_nn_maps_detailed_um(
+    final_data: pd.DataFrame,
+    dist_df: pd.DataFrame,
+    outdir,
+    max_rois: int = 250,
+    min_tumour_cells: int = 20,
+    min_non_t_cells_with_dist: int = 50,
+    invert_y: bool = True,
+    representative_per_patient: bool = True,
+):
+    out = Path(outdir) / "Stage11e_SpatialMaps_DETAILED_um"
+    ensure_dir(out)
+
+    if dist_df is None or dist_df.empty:
+        print("[Stage11e] dist_df empty, skipping.")
+        return
+
+    df = get_valid_um(final_data).copy()
+    merged = df.merge(dist_df[["CellID", "NN_Distance_um"]], on="CellID", how="left")
+    merged["Main_Cell_Type"] = merged["Main_Cell_Type"].astype(str).str.strip()
+    merged["Spot Id 1"] = merged["Spot Id 1"].astype(str).str.strip()
+    merged["Spot Id 2"] = merged["Spot Id 2"].astype(str).str.strip()
+
+    qc_rows = []
+    for roi, sub in merged.groupby("Spot Id 2"):
+        pid = sub["Spot Id 1"].mode().iat[0] if not sub["Spot Id 1"].mode().empty else str(sub["Spot Id 1"].iloc[0])
+        tum = sub[sub["Main_Cell_Type"] == "Tumour"]
+        non_t = sub[(sub["Main_Cell_Type"] != "Tumour") & sub["NN_Distance_um"].notna()]
+        qc_rows.append({
+            "Spot Id 1": pid,
+            "Spot Id 2": roi,
+            "n_cells_total": int(len(sub)),
+            "n_tumour": int(len(tum)),
+            "n_non_t_with_dist": int(len(non_t)),
+        })
+
+    qc = pd.DataFrame(qc_rows).sort_values(["n_non_t_with_dist", "n_tumour"], ascending=False)
+    qc.to_csv(out / "ROI_SpatialMap_QC.csv", index=False)
+
+    eligible = qc[(qc["n_tumour"] >= int(min_tumour_cells)) & (qc["n_non_t_with_dist"] >= int(min_non_t_cells_with_dist))].copy()
+    if eligible.empty:
+        print("[Stage11e] No ROIs passed thresholds.")
+        return
+
+    eligible_bulk = eligible.sort_values("n_non_t_with_dist", ascending=False).head(int(max_rois)) if (max_rois is not None and len(eligible) > int(max_rois)) else eligible
+    eligible_rois_bulk = set(eligible_bulk["Spot Id 2"].astype(str).tolist())
+
+    def _plot_one_roi(roi_id: str, subdf: pd.DataFrame, outpath: Path, title: str):
+        tum = subdf[subdf["Main_Cell_Type"] == "Tumour"]
+        non_t = subdf[(subdf["Main_Cell_Type"] != "Tumour") & subdf["NN_Distance_um"].notna()]
+        if tum.empty or non_t.empty:
+            return False
+
+        plt.figure(figsize=(6.5, 6.5))
+        sc = plt.scatter(non_t["X_um"], non_t["Y_um"], c=non_t["NN_Distance_um"], cmap="viridis", s=6, linewidths=0)
+        plt.colorbar(sc, label="NN distance to tumour (µm)")
+        plt.scatter(tum["X_um"], tum["Y_um"], c="k", marker="x", s=12, linewidths=0.7)
+        plt.axis("equal")
+        if invert_y:
+            plt.gca().invert_yaxis()
+        plt.xticks([]); plt.yticks([])
+        plt.title(title)
+        save_plot(outpath)
+        return True
+
+    n_saved = 0
+    for roi, sub in merged.groupby("Spot Id 2"):
+        roi_s = str(roi)
+        if roi_s not in eligible_rois_bulk:
+            continue
+        n_saved += int(_plot_one_roi(roi_s, sub, out / f"Spatial_NN_DETAILED_um_{safe_name(roi_s)}.png", f"NN-to-tumour map (µm) — ROI {roi_s}"))
+    print(f"[Stage11e] Saved {n_saved} bulk maps to: {out}")
+
+    if representative_per_patient:
+        rep_dir = out / "Representative_PerPatient"
+        ensure_dir(rep_dir)
+
+        rep_rows = []
+        for pid, subp in eligible.groupby("Spot Id 1"):
+            target = float(np.median(subp["n_tumour"].values))
+            cand = subp.copy()
+            cand["tumour_dev"] = (cand["n_tumour"] - target).abs()
+            cand = cand.sort_values(["tumour_dev", "n_non_t_with_dist"], ascending=[True, False])
+            rep_rows.append(cand.iloc[0])
+
+        rep = pd.DataFrame(rep_rows).sort_values(["Spot Id 1"])
+        rep.to_csv(out / "Representative_ROI_PerPatient.csv", index=False)
+
+        rep_rois = set(rep["Spot Id 2"].astype(str).tolist())
+        n_rep = 0
+        for roi, sub in merged.groupby("Spot Id 2"):
+            roi_s = str(roi)
+            if roi_s not in rep_rois:
+                continue
+            pid = sub["Spot Id 1"].mode().iat[0] if not sub["Spot Id 1"].mode().empty else str(sub["Spot Id 1"].iloc[0])
+            n_rep += int(_plot_one_roi(roi_s, sub, rep_dir / f"RepROI_Patient_{safe_name(pid)}__ROI_{safe_name(roi_s)}.png",
+                                       f"Representative ROI — Patient {pid} — ROI {roi_s}"))
+        print(f"[Stage11e] Saved {n_rep} representative maps to: {rep_dir}")
+
+
+# ===================== STAGE 14 (µm-native) — Ripley helpers =====================
+def _core_window_bbox_um(core_df: pd.DataFrame):
+    pts = core_df[["X_um", "Y_um"]].dropna().to_numpy()
+    if pts.size == 0:
+        return None
+    xmin, ymin = pts.min(axis=0)
+    xmax, ymax = pts.max(axis=0)
+    return (xmin, xmax, ymin, ymax)
+
+def _bbox_area_um2(window_bbox) -> float:
+    xmin, xmax, ymin, ymax = window_bbox
+    return float((xmax - xmin) * (ymax - ymin))
+
+def _border_mask(points_um: np.ndarray, window_bbox, r_um: float) -> np.ndarray:
+    xmin, xmax, ymin, ymax = window_bbox
+    x, y = points_um[:, 0], points_um[:, 1]
+    return (x >= xmin + r_um) & (x <= xmax - r_um) & (y >= ymin + r_um) & (y <= ymax - r_um)
+
+def _query_ball_counts(tree: cKDTree, src_points: np.ndarray, r_um: float) -> np.ndarray:
+    try:
+        return tree.query_ball_point(src_points, r_um, return_length=True).astype(float)
+    except TypeError:
+        neigh = tree.query_ball_point(src_points, r_um)
+        return np.array([len(v) for v in neigh], dtype=float)
+
+def _K_self_um(points_um: np.ndarray, r_vals_um: np.ndarray, area_um2: float, window_bbox):
+    n = len(points_um)
+    if n < 2 or area_um2 <= 0 or window_bbox is None:
+        return np.full_like(r_vals_um, np.nan, dtype=float), np.zeros_like(r_vals_um, dtype=int)
+
+    tree = cKDTree(points_um)
+    K = np.full_like(r_vals_um, np.nan, dtype=float)
+    n_centres = np.zeros_like(r_vals_um, dtype=int)
+
+    for i, r_um in enumerate(r_vals_um):
+        mask = _border_mask(points_um, window_bbox, float(r_um))
+        src = points_um[mask]
+        m = len(src)
+        n_centres[i] = m
+        if m < 2:
+            K[i] = np.nan
+            continue
+        counts = _query_ball_counts(tree, src, float(r_um)) - 1.0
+        K[i] = area_um2 * counts.sum() / (m * (m - 1))
+    return K, n_centres
+
+def _K_cross_um(source_um: np.ndarray, target_um: np.ndarray, r_vals_um: np.ndarray, area_um2: float, window_bbox):
+    n_s, n_t = len(source_um), len(target_um)
+    if n_s == 0 or n_t == 0 or area_um2 <= 0 or window_bbox is None:
+        return np.full_like(r_vals_um, np.nan, dtype=float), np.zeros_like(r_vals_um, dtype=int)
+
+    tree_t = cKDTree(target_um)
+    K = np.full_like(r_vals_um, np.nan, dtype=float)
+    n_centres = np.zeros_like(r_vals_um, dtype=int)
+
+    for i, r_um in enumerate(r_vals_um):
+        mask = _border_mask(source_um, window_bbox, float(r_um))
+        src = source_um[mask]
+        m = len(src)
+        n_centres[i] = m
+        if m == 0:
+            K[i] = np.nan
+            continue
+        counts = _query_ball_counts(tree_t, src, float(r_um))
+        K[i] = area_um2 * counts.sum() / (m * n_t)
+    return K, n_centres
+
+def _L_minus_r_um(K_um2: np.ndarray, r_um: np.ndarray) -> np.ndarray:
+    return np.sqrt(np.maximum(K_um2, 0.0) / np.pi) - r_um
+
+def _plot_LminusR_survival(pat_df: pd.DataFrame, out_dir: Path, title: str, stem: str):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    tmp = pat_df.dropna(subset=["SurvivalCategory"])
+    for surv, sub in tmp.groupby("SurvivalCategory"):
+        med = sub.groupby("r_um")["L_minus_r_um"].median()
+        ax.plot(med.index, med.values, label=str(surv), color=SURV_PALETTE[str(surv)])
+    ax.axhline(0, ls="--", lw=1, color="gray")
+    ax.set_xlabel("r (µm)")
+    ax.set_ylabel("L(r) − r (µm)  (CSR=0)")
+    ax.set_title(title)
+    ax.legend(title="Survival")
+    fig.tight_layout()
+    savefig_both(fig, out_dir / stem)
+    plt.close(fig)
+
+def run_ripley_module(
+    final_data: pd.DataFrame,
+    clinical: pd.DataFrame,
+    area_lookup: dict,
+    output_dir: Path,
+    module_name: str,
+    source_selector,
+    target_selector,
+    area_kind: str,
+    min_source: int = 5,
+    min_target: int = 5,
+    make_plots: bool = True,
+    stats_radii=(50, 100),
+):
+    out = Path(output_dir) / module_name
+    ensure_dir(out)
+
+    r_um = RIPLEY_R_UM
+    core_dfs = []
+
+    for (pat, core), grp in final_data.groupby(["Spot Id 1", "Spot Id 2"]):
+        g = get_valid_um(grp)
+        window_bbox = _core_window_bbox_um(g)
+        if window_bbox is None:
+            continue
+        bbox_area = _bbox_area_um2(window_bbox)
+        area_um2 = get_area_um2(area_lookup, pat, core, area_kind, bbox_area)
+
+        src = source_selector(g)
+        tgt = target_selector(g)
+
+        if len(src) < min_source or len(tgt) < min_target:
+            continue
+
+        src_pts = src[["X_um", "Y_um"]].to_numpy()
+        tgt_pts = tgt[["X_um", "Y_um"]].to_numpy()
+
+        if src is tgt:
+            K_um2, n_centres = _K_self_um(src_pts, r_um, area_um2, window_bbox)
+        else:
+            K_um2, n_centres = _K_cross_um(src_pts, tgt_pts, r_um, area_um2, window_bbox)
+
+        Lmr_um = _L_minus_r_um(K_um2, r_um)
+
+        K_um2  = np.where(n_centres >= MIN_CENTRES_RIPLEY, K_um2, np.nan)
+        Lmr_um = np.where(n_centres >= MIN_CENTRES_RIPLEY, Lmr_um, np.nan)
+
+        core_dfs.append(pd.DataFrame({
+            "Spot Id 1": pat, "Spot Id 2": core,
+            "r_um": r_um,
+            "Area_um2_used": float(area_um2),
+            "n_centres_used": n_centres.astype(int),
+            "K_um2": K_um2,
+            "L_minus_r_um": Lmr_um
+        }))
+
+    if not core_dfs:
+        print(f"[{module_name}] No valid cores.")
+        return
+
+    core_df = pd.concat(core_dfs, ignore_index=True)
+    core_df.to_csv(out / f"{module_name}_PerCore.csv", index=False)
+
+    pat_df = (core_df.groupby(["Spot Id 1", "r_um"])[["K_um2", "L_minus_r_um"]]
+              .median().reset_index()
+              .merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left"))
+    pat_df.to_csv(out / f"{module_name}_PerPatient.csv", index=False)
+
+    if make_plots:
+        _plot_LminusR_survival(pat_df, out, title=module_name.replace("_", " "), stem="LminusR_SurvivalStratified")
+
+    for r0 in stats_radii:
+        stats_by_group(pat_df[np.isclose(pat_df["r_um"], r0)], "SurvivalCategory", "L_minus_r_um", out, f"LminusR_r{r0}")
+
+def stage14_ripley(final_data, clinical, area_lookup, base_out):
+    run_ripley_module(
+        final_data, clinical, area_lookup, base_out,
+        module_name="Stage14a_Tumor_SelfK_um",
+        source_selector=lambda g: g[g["Main_Cell_Type"] == "Tumour"],
+        target_selector=lambda g: g[g["Main_Cell_Type"] == "Tumour"],
+        area_kind="tumour",
+        min_source=5, min_target=5
+    )
+
+    run_ripley_module(
+        final_data, clinical, area_lookup, base_out,
+        module_name="Stage14a_1_TumorVsNonTumor_um",
+        source_selector=lambda g: g[g["Main_Cell_Type"] == "Tumour"],
+        target_selector=lambda g: g[g["Main_Cell_Type"] != "Tumour"],
+        area_kind="total",
+        min_source=5, min_target=5
+    )
+
+    out = Path(base_out) / "Stage14a_2_Tumor_vs_Immune_um"
+    ensure_dir(out)
+    for subtype in IMMUNE_DETAILED:
+        run_ripley_module(
+            final_data, clinical, area_lookup, out,
+            module_name=f"Tumor_vs_{sanitize(subtype)}_CrossK",
+            source_selector=lambda g: g[g["Main_Cell_Type"] == "Tumour"],
+            target_selector=lambda g, st=subtype: g[(g["Main_Cell_Type"] == "Immune") & (g["Detailed_Phenotype"] == st)],
+            area_kind="total",
+            min_source=5, min_target=5
+        )
+
+    out = Path(base_out) / "Stage14a_3_Tumor_vs_CAFSubtypes_um"
+    ensure_dir(out)
+    for subtype in CAF_DETAILED:
+        run_ripley_module(
+            final_data, clinical, area_lookup, out,
+            module_name=f"Tumor_vs_{sanitize(subtype)}_CrossK",
+            source_selector=lambda g: g[g["Main_Cell_Type"] == "Tumour"],
+            target_selector=lambda g, st=subtype: g[(g["Main_Cell_Type"] == "CAF") & (g["Detailed_Phenotype"] == st)],
+            area_kind="total",
+            min_source=5, min_target=5
+        )
+
+
+# ===================== STAGE 14b: Tumour -> CAF nearest-cell distance (patient-level) =====================
+def stage14b_tumour_caf_distance_um(final_data, clinical, output_dir):
+    """
+    Nearest-cell distances via cKDTree.query(k=1):
+      For each tumour cell, distance to nearest CAF (any) OR nearest CAF subtype.
+    Then per-core median -> per-patient median-of-cores.
+
+    Outputs:
+      A) Any CAF by survival (patient)
+      B) CAF subtype by survival (patient)
+      C) Across CAF subtypes pooled across survival (patient; grouped by CAF_Subtype)
+    """
+    out_base = Path(output_dir) / "Stage14b_TumorCAF_Distance_um"
+    ensure_dir(out_base)
+
+    df = get_valid_um(final_data)
+    caf_all = df[df["Main_Cell_Type"] == "CAF"].copy()
+    tumor_all = df[df["Main_Cell_Type"] == "Tumour"].copy()
+
+    # ---------------- A) Any CAF (per-core) ----------------
+    core_rows = []
+    for (pat, core), grp in df.groupby(["Spot Id 1", "Spot Id 2"]):
+        tum = grp[grp["Main_Cell_Type"] == "Tumour"]
+        caf = grp[grp["Main_Cell_Type"] == "CAF"]
+        if tum.empty or caf.empty:
+            continue
+        tree = cKDTree(caf[["X_um", "Y_um"]].to_numpy())
+        d_um, _ = tree_query(tree, tum[["X_um", "Y_um"]].to_numpy(), k=1)
+        core_rows.append({
+            "Spot Id 1": str(pat).strip(),
+            "Spot Id 2": str(core).strip(),
+            "N_tumour": int(len(d_um)),
+            "Median_Distance_um": float(np.median(d_um)),
+        })
+
+    df_core_any = pd.DataFrame(core_rows)
+    df_core_any.to_csv(out_base / "TumorToAnyCAF_PerCore.csv", index=False)
+
+    if df_core_any.empty:
+        print("[14b] No tumour–CAF distances computed (any CAF).")
+        return
+
+    # patient median-of-cores
+    med_pt = core_to_patient_median(df_core_any, value_cols="Median_Distance_um")
+    med_pt = med_pt.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+    med_pt.to_csv(out_base / "TumorToAnyCAF_PerPatient_MedianOfCores.csv", index=False)
+
+    stats_by_group(med_pt, "SurvivalCategory", "Median_Distance_um", out_base, "TumorToAnyCAF_bySurvival")
+    plot_box_with_points(
+        med_pt, x="SurvivalCategory", y="Median_Distance_um",
+        outpath=out_base / "Boxplot_TumorToAnyCAF_bySurvival.png",
+        title="Tumour→Any CAF nearest distance (µm) per patient (median-of-cores) by Survival",
+        order=SURV_ORDER, palette=SURV_PALETTE, rotate=0, point_size=3, point_alpha=0.25
+    )
+
+    # ---------------- B) CAF subtype (per-core) ----------------
+    out_sub = Path(output_dir) / "Stage14b_TumorCAF_ByCAFSubtype_um"
+    ensure_dir(out_sub)
+
+    rec = []
+    for caf_type in CAF_DETAILED:
+        caf_pts_type = caf_all[caf_all["Detailed_Phenotype"] == caf_type]
+        for (pat, core), tum_pts in tumor_all.groupby(["Spot Id 1", "Spot Id 2"]):
+            caf = caf_pts_type[(caf_pts_type["Spot Id 1"] == pat) & (caf_pts_type["Spot Id 2"] == core)]
+            if tum_pts.empty or caf.empty:
+                continue
+            tree = cKDTree(caf[["X_um", "Y_um"]].to_numpy())
+            d_um, _ = tree_query(tree, tum_pts[["X_um", "Y_um"]].to_numpy(), k=1)
+            rec.append({
+                "Spot Id 1": str(pat).strip(),
+                "Spot Id 2": str(core).strip(),
+                "CAF_Subtype": caf_type,
+                "N_tumour": int(len(d_um)),
+                "Median_Distance_um": float(np.median(d_um)),
+            })
+
+    df_core_sub = pd.DataFrame(rec)
+    df_core_sub.to_csv(out_sub / "TumorToCAFSubtype_PerCore.csv", index=False)
+
+    if not df_core_sub.empty:
+        df_pt_sub = core_to_patient_median(df_core_sub,
+                                           value_cols="Median_Distance_um",
+                                           extra_group_cols=["CAF_Subtype"])
+        df_pt_sub = df_pt_sub.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+        df_pt_sub.to_csv(out_sub / "TumorToCAFSubtype_PerPatient_MedianOfCores.csv", index=False)
+
+        # subtype-by-survival plots + stats
+        for caf_type in ordered_subset(df_pt_sub["CAF_Subtype"].dropna().unique().tolist(), CAF_DETAILED):
+            sub = df_pt_sub[df_pt_sub["CAF_Subtype"] == caf_type].copy()
+            if sub.empty:
+                continue
+            plot_box_with_points(
+                sub, x="SurvivalCategory", y="Median_Distance_um",
+                outpath=out_sub / f"Boxplot_TumorTo_{sanitize(caf_type)}_bySurvival.png",
+                title=f"Tumour→{caf_type} nearest distance (µm) per patient (median-of-cores) by Survival",
+                order=SURV_ORDER, palette=SURV_PALETTE, rotate=0, point_size=3, point_alpha=0.25
+            )
+            stats_by_group(sub, "SurvivalCategory", "Median_Distance_um", out_sub, f"TumorTo_{sanitize(caf_type)}_bySurvival")
+
+        # ---------------- C) Across CAF subtypes pooled across survival ----------------
+        pooled = df_pt_sub.dropna(subset=["CAF_Subtype", "Median_Distance_um"]).copy()
+        pooled.to_csv(out_sub / "TumorToCAFSubtype_PooledAcrossSurvival_PerPatient.csv", index=False)
+
+        plot_box_with_points(
+            pooled, x="CAF_Subtype", y="Median_Distance_um",
+            outpath=out_sub / "Boxplot_TumorToCAFSubtype_PooledAcrossSurvival.png",
+            title="Tumour→CAF subtype nearest distance (µm) per patient (median-of-cores), pooled across survival",
+            order=ordered_subset(pooled["CAF_Subtype"].unique().tolist(), CAF_DETAILED),
+            palette=None, rotate=90, point_size=3, point_alpha=0.25
+        )
+        stats_by_group(pooled, "CAF_Subtype", "Median_Distance_um", out_sub, "TumorToCAFSubtype_PooledAcrossSurvival")
+
+    print("[14b] Complete.")
+
+
+# ===================== STAGE 14c: First neighbour identity (kept) =====================
+def stage14c_first_neighbor_identity_um(final_data, clinical, output_dir):
+    out = Path(output_dir) / "Stage14c_FirstNeighbor_Identity_um"
+    ensure_dir(out)
+
+    valid = get_valid_um(final_data)
+    tumor = valid[valid["Main_Cell_Type"] == "Tumour"]
+    other = valid[valid["Main_Cell_Type"] != "Tumour"]
+
+    rec = []
+    for (pat, core), tum_grp in tumor.groupby(["Spot Id 1", "Spot Id 2"]):
+        oth = other[(other["Spot Id 1"] == pat) & (other["Spot Id 2"] == core)]
+        if tum_grp.empty or oth.empty:
+            continue
+        tree = cKDTree(oth[["X_um", "Y_um"]].to_numpy())
+        d_um, idx = tree_query(tree, tum_grp[["X_um", "Y_um"]].to_numpy(), k=1)
+
+        oth = oth.reset_index(drop=True)
+        for i in range(len(d_um)):
+            nbr = oth.iloc[int(idx[i])]
+            nd = canonicalize_detailed_pheno(nbr.get("Detailed_Phenotype", np.nan))
+            if pd.isna(nd):
+                continue
+            rec.append({
+                "Spot Id 1": str(pat).strip(),
+                "Spot Id 2": str(core).strip(),
+                "Neighbor_Distance_um": float(d_um[i]),
+                "Neighbor_Detailed": nd,
+                "Neighbor_MainType": str(nbr.get("Main_Cell_Type", "")).strip(),
+            })
+
+    df = pd.DataFrame(rec).merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+    df.to_csv(out / "Tumor_FirstNeighbors_PerCell_um.csv", index=False)
+    if df.empty:
+        print("[14c] No neighbours computed.")
+        return
+
+    core_comp = df.groupby(["Spot Id 1", "Spot Id 2", "Neighbor_Detailed"]).size().unstack(fill_value=0)
+    core_comp = core_comp.div(core_comp.sum(axis=1), axis=0).reset_index()
+    core_comp.to_csv(out / "NeighborDetailed_Composition_PerCore.csv", index=False)
+
+    ph_cols = [c for c in core_comp.columns if c not in {"Spot Id 1", "Spot Id 2"}]
+    ph_cols = ordered_subset(ph_cols, GROUP_ORDER_DETAILED)
+
+    pat_comp = (core_comp.groupby("Spot Id 1")[ph_cols].median().reset_index()
+                .merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left"))
+    pat_comp.to_csv(out / "NeighborDetailed_Composition_PerPatient_MedianOfCores.csv", index=False)
+
+    for ph in ph_cols:
+        plot_box_with_points(
+            pat_comp, x="SurvivalCategory", y=ph,
+            outpath=out / f"Boxplot_Detailed_{sanitize(ph)}_bySurvival.png",
+            title=f"Nearest-neighbour composition (median-of-cores): {ph}",
+            order=SURV_ORDER, palette=SURV_PALETTE, rotate=0, point_size=3, point_alpha=0.25
+        )
+        stats_by_group(pat_comp, "SurvivalCategory", ph, out, f"NeighborDetailed_{sanitize(ph)}")
+
+    plot_df = pat_comp.set_index("Spot Id 1")[ph_cols]
+    plot_heatmap_df(plot_df, out / "Heatmap_NeighborDetailed_Composition_PerPatient.png",
+                    title="Tumour nearest-neighbour composition (per-patient median-of-cores)",
+                    cmap="mako", figsize=(min(22, 2 + 0.45 * len(ph_cols)), 8), linewidths=0.3)
+
+
+# ===================== STAGE 14d: CAF -> Immune nearest-cell distances (patient-level) =====================
+def stage14d_caf_immune_proximity_um(final_data: pd.DataFrame, clinical: pd.DataFrame, output_dir: str) -> None:
+    """
+    Nearest-cell distances via cKDTree.query(k=1):
+      For each immune cell, distance to nearest CAF (any) OR nearest CAF subtype.
+    Then per-core median -> per-patient median-of-cores.
+    """
+    out_dir = Path(output_dir) / "Stage14d_CAF_Immune_Proximity_um"
+    ensure_dir(out_dir)
+
+    df = get_valid_um(final_data)
+
+    caf_types = ordered_subset(
+        df.loc[df["Main_Cell_Type"] == "CAF", "Detailed_Phenotype"].dropna().unique().tolist(),
+        CAF_DETAILED
+    )
+    imm_types = ordered_subset(
+        df.loc[df["Main_Cell_Type"] == "Immune", "Detailed_Phenotype"].dropna().unique().tolist(),
+        IMMUNE_DETAILED
+    )
+
+    # ---------- (A) ALL CAFs vs each immune subtype (per-core medians) ----------
+    rec_allcaf = []
+    for (pat, core), grp in df.groupby(["Spot Id 1", "Spot Id 2"]):
+        caf_pts = grp[grp["Main_Cell_Type"] == "CAF"]
+        if caf_pts.empty:
+            continue
+        tree = cKDTree(caf_pts[["X_um", "Y_um"]].to_numpy())
+
+        for imm in imm_types:
+            ims = grp[(grp["Main_Cell_Type"] == "Immune") & (grp["Detailed_Phenotype"] == imm)]
+            if ims.empty:
+                continue
+            d_um, _ = tree_query(tree, ims[["X_um", "Y_um"]].to_numpy(), k=1)
+            rec_allcaf.append({
+                "Spot Id 1": str(pat).strip(),
+                "Spot Id 2": str(core).strip(),
+                "Immune_Subtype": imm,
+                "N_immune": int(len(d_um)),
+                "Median_Distance_um": float(np.median(d_um)),
+            })
+
+    df_core_all = pd.DataFrame(rec_allcaf)
+    df_core_all.to_csv(out_dir / "ALLCAF_vs_ImmuneSubtype_PerCore_MedianDist_um.csv", index=False)
+
+    if not df_core_all.empty:
+        df_pt_all = core_to_patient_median(df_core_all,
+                                           value_cols="Median_Distance_um",
+                                           extra_group_cols=["Immune_Subtype"])
+        df_pt_all = df_pt_all.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+        df_pt_all.to_csv(out_dir / "ALLCAF_vs_ImmuneSubtype_PerPatient_MedianOfCores_um.csv", index=False)
+
+        for imm in ordered_subset(df_pt_all["Immune_Subtype"].dropna().unique().tolist(), IMMUNE_DETAILED):
+            sub = df_pt_all[df_pt_all["Immune_Subtype"] == imm].copy()
+            if sub.empty:
+                continue
+            plot_box_with_points(
+                sub, x="SurvivalCategory", y="Median_Distance_um",
+                outpath=out_dir / f"Boxplot_ALLCAF_to_{sanitize(imm)}_bySurvival.png",
+                title=f"All CAF → {imm} nearest distance (µm) per patient (median-of-cores) by Survival",
+                order=SURV_ORDER, palette=SURV_PALETTE, rotate=0, point_size=3, point_alpha=0.25
+            )
+            stats_by_group(sub, "SurvivalCategory", "Median_Distance_um", out_dir, f"ALLCAF_to_{sanitize(imm)}_bySurvival")
+
+    # ---------- (B) CAF subtype vs each immune subtype (per-core medians) ----------
+    rec_subcaf = []
+    for (pat, core), grp in df.groupby(["Spot Id 1", "Spot Id 2"]):
+        for caf in caf_types:
+            caf_pts = grp[(grp["Main_Cell_Type"] == "CAF") & (grp["Detailed_Phenotype"] == caf)]
+            if caf_pts.empty:
+                continue
+            tree = cKDTree(caf_pts[["X_um", "Y_um"]].to_numpy())
+
+            for imm in imm_types:
+                ims = grp[(grp["Main_Cell_Type"] == "Immune") & (grp["Detailed_Phenotype"] == imm)]
+                if ims.empty:
+                    continue
+                d_um, _ = tree_query(tree, ims[["X_um", "Y_um"]].to_numpy(), k=1)
+                rec_subcaf.append({
+                    "Spot Id 1": str(pat).strip(),
+                    "Spot Id 2": str(core).strip(),
+                    "CAF_Subtype": caf,
+                    "Immune_Subtype": imm,
+                    "N_immune": int(len(d_um)),
+                    "Median_Distance_um": float(np.median(d_um)),
+                })
+
+    df_core_sub = pd.DataFrame(rec_subcaf)
+    df_core_sub.to_csv(out_dir / "CAFSubtype_vs_ImmuneSubtype_PerCore_MedianDist_um.csv", index=False)
+
+    if not df_core_sub.empty:
+        df_pt_sub = core_to_patient_median(df_core_sub,
+                                           value_cols="Median_Distance_um",
+                                           extra_group_cols=["CAF_Subtype", "Immune_Subtype"])
+        df_pt_sub = df_pt_sub.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+        df_pt_sub.to_csv(out_dir / "CAFSubtype_vs_ImmuneSubtype_PerPatient_MedianOfCores_um.csv", index=False)
+
+        for caf in ordered_subset(df_pt_sub["CAF_Subtype"].dropna().unique().tolist(), CAF_DETAILED):
+            for imm in ordered_subset(df_pt_sub["Immune_Subtype"].dropna().unique().tolist(), IMMUNE_DETAILED):
+                sub = df_pt_sub[(df_pt_sub["CAF_Subtype"] == caf) & (df_pt_sub["Immune_Subtype"] == imm)].copy()
+                if sub.empty:
+                    continue
+                plot_box_with_points(
+                    sub, x="SurvivalCategory", y="Median_Distance_um",
+                    outpath=out_dir / f"Boxplot_{sanitize(caf)}_to_{sanitize(imm)}_bySurvival.png",
+                    title=f"{caf} → {imm} nearest distance (µm) per patient (median-of-cores) by Survival",
+                    order=SURV_ORDER, palette=SURV_PALETTE, rotate=0, point_size=3, point_alpha=0.25
+                )
+                stats_by_group(sub, "SurvivalCategory", "Median_Distance_um", out_dir, f"{sanitize(caf)}_to_{sanitize(imm)}_bySurvival")
+
+    print("[14d] Complete.")
+
+
+# ===================== STAGE 14g (NEW): Tumour -> Immune nearest-cell distances (patient-level) =====================
+def stage14g_tumour_immune_proximity_um(final_data: pd.DataFrame, clinical: pd.DataFrame, output_dir: str) -> None:
+    """
+    Nearest-cell distances via cKDTree.query(k=1):
+      For each tumour cell, distance to nearest Immune (any) OR nearest Immune subtype.
+    Then per-core median -> per-patient median-of-cores.
+
+    Also does pooled-across-survival comparisons across Immune subtypes.
+    """
+    out_dir = Path(output_dir) / "Stage14g_Tumor_Immune_Proximity_um"
+    ensure_dir(out_dir)
+
+    df = get_valid_um(final_data)
+
+    imm_types = ordered_subset(
+        df.loc[df["Main_Cell_Type"] == "Immune", "Detailed_Phenotype"].dropna().unique().tolist(),
+        IMMUNE_DETAILED
+    )
+
+    # ---------- (A) Any Immune (per-core) ----------
+    rec_any = []
+    for (pat, core), grp in df.groupby(["Spot Id 1", "Spot Id 2"]):
+        tum = grp[grp["Main_Cell_Type"] == "Tumour"]
+        imm = grp[grp["Main_Cell_Type"] == "Immune"]
+        if tum.empty or imm.empty:
+            continue
+        tree = cKDTree(imm[["X_um", "Y_um"]].to_numpy())
+        d_um, _ = tree_query(tree, tum[["X_um", "Y_um"]].to_numpy(), k=1)
+        rec_any.append({
+            "Spot Id 1": str(pat).strip(),
+            "Spot Id 2": str(core).strip(),
+            "N_tumour": int(len(d_um)),
+            "Median_Distance_um": float(np.median(d_um)),
+        })
+
+    df_core_any = pd.DataFrame(rec_any)
+    df_core_any.to_csv(out_dir / "TumorToAnyImmune_PerCore.csv", index=False)
+
+    if not df_core_any.empty:
+        df_pt_any = core_to_patient_median(df_core_any, value_cols="Median_Distance_um")
+        df_pt_any = df_pt_any.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+        df_pt_any.to_csv(out_dir / "TumorToAnyImmune_PerPatient_MedianOfCores.csv", index=False)
+
+        plot_box_with_points(
+            df_pt_any, x="SurvivalCategory", y="Median_Distance_um",
+            outpath=out_dir / "Boxplot_TumorToAnyImmune_bySurvival.png",
+            title="Tumour→Any Immune nearest distance (µm) per patient (median-of-cores) by Survival",
+            order=SURV_ORDER, palette=SURV_PALETTE, rotate=0, point_size=3, point_alpha=0.25
+        )
+        stats_by_group(df_pt_any, "SurvivalCategory", "Median_Distance_um", out_dir, "TumorToAnyImmune_bySurvival")
+
+    # ---------- (B) Immune subtype (per-core) ----------
+    rec_sub = []
+    for imm_type in imm_types:
+        imm_all_type = df[(df["Main_Cell_Type"] == "Immune") & (df["Detailed_Phenotype"] == imm_type)]
+        if imm_all_type.empty:
+            continue
+        for (pat, core), tum_pts in df[df["Main_Cell_Type"] == "Tumour"].groupby(["Spot Id 1", "Spot Id 2"]):
+            imm_pts = imm_all_type[(imm_all_type["Spot Id 1"] == pat) & (imm_all_type["Spot Id 2"] == core)]
+            if tum_pts.empty or imm_pts.empty:
+                continue
+            tree = cKDTree(imm_pts[["X_um", "Y_um"]].to_numpy())
+            d_um, _ = tree_query(tree, tum_pts[["X_um", "Y_um"]].to_numpy(), k=1)
+            rec_sub.append({
+                "Spot Id 1": str(pat).strip(),
+                "Spot Id 2": str(core).strip(),
+                "Immune_Subtype": imm_type,
+                "N_tumour": int(len(d_um)),
+                "Median_Distance_um": float(np.median(d_um)),
+            })
+
+    df_core_sub = pd.DataFrame(rec_sub)
+    df_core_sub.to_csv(out_dir / "TumorToImmuneSubtype_PerCore.csv", index=False)
+
+    if not df_core_sub.empty:
+        df_pt_sub = core_to_patient_median(df_core_sub,
+                                           value_cols="Median_Distance_um",
+                                           extra_group_cols=["Immune_Subtype"])
+        df_pt_sub = df_pt_sub.merge(clinical[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+        df_pt_sub.to_csv(out_dir / "TumorToImmuneSubtype_PerPatient_MedianOfCores.csv", index=False)
+
+        # subtype-by-survival plots + stats
+        for imm_type in ordered_subset(df_pt_sub["Immune_Subtype"].dropna().unique().tolist(), IMMUNE_DETAILED):
+            sub = df_pt_sub[df_pt_sub["Immune_Subtype"] == imm_type].copy()
+            if sub.empty:
+                continue
+            plot_box_with_points(
+                sub, x="SurvivalCategory", y="Median_Distance_um",
+                outpath=out_dir / f"Boxplot_TumorTo_{sanitize(imm_type)}_bySurvival.png",
+                title=f"Tumour→{imm_type} nearest distance (µm) per patient (median-of-cores) by Survival",
+                order=SURV_ORDER, palette=SURV_PALETTE, rotate=0, point_size=3, point_alpha=0.25
+            )
+            stats_by_group(sub, "SurvivalCategory", "Median_Distance_um", out_dir, f"TumorTo_{sanitize(imm_type)}_bySurvival")
+
+        # pooled-across-survival: compare immune subtypes (patient-level)
+        pooled = df_pt_sub.dropna(subset=["Immune_Subtype", "Median_Distance_um"]).copy()
+        pooled.to_csv(out_dir / "TumorToImmuneSubtype_PooledAcrossSurvival_PerPatient.csv", index=False)
+
+        plot_box_with_points(
+            pooled, x="Immune_Subtype", y="Median_Distance_um",
+            outpath=out_dir / "Boxplot_TumorToImmuneSubtype_PooledAcrossSurvival.png",
+            title="Tumour→Immune subtype nearest distance (µm) per patient (median-of-cores), pooled across survival",
+            order=ordered_subset(pooled["Immune_Subtype"].unique().tolist(), IMMUNE_DETAILED),
+            palette=None, rotate=90, point_size=3, point_alpha=0.25
+        )
+        stats_by_group(pooled, "Immune_Subtype", "Median_Distance_um", out_dir, "TumorToImmuneSubtype_PooledAcrossSurvival")
+
+    print("[14g] Complete.")
+
+
+# ===================== MAIN =====================
+def main():
+    print(">>> Starting µm-native unified pipeline (complete, patient-level proximity, triangle Stage10 heatmaps)")
+
+    base = Path("/data/home/hfx986/PhD/spatial_um_native")
+    base.mkdir(parents=True, exist_ok=True)
+
+    final_csv = "/data/home/hfx986/Combat/Final_Cell_Phenotypes.csv"
+    area_csv  = "/data/home/hfx986/Area.csv"
+    clin_csv  = "/data/home/hfx986/Clinical_Data.csv"
+
+    final_data, area_data, clinical, area_lookup = load_data(final_csv, area_csv, clin_csv)
+
+    # ---- Stage 10 ----
+    print(">>> Stage 10 (cell–cell interactions, µm-native)")
+    out10 = base / f"Stage10_CellCellInteraction/Hybrid_{int(STAGE10_RADIUS_UM)}um_{int(STAGE10_KNN)}NN_DetailedPhenotype"
+    stage10_hybrid_interaction_maps_um(
+        final_data=final_data,
+        clinical_df=clinical,
+        outdir=out10,
+        phenotype_col="Detailed_Phenotype",
+        radius_um=STAGE10_RADIUS_UM,
+        k_nn=STAGE10_KNN,
+        group_order=GROUP_ORDER_DETAILED,
+        cell_type_map=CELL_TYPE_MAP,
+        cat_colors=CAT_COLORS,
+        normalize=STAGE10_NORMALIZE,
+        undirected=STAGE10_UNDIRECTED,
+        stats_on=STAGE10_STATS_ON,
+    )
+
+    # ---- Stage 11 ----
+    print(">>> Stage 11 (NN-to-tumour + maps, µm-native)")
+    dist_df, phenos, palette = stage11c_nn_per_cell_detailed_um(final_data, base, GROUP_ORDER_DETAILED)
+    med_df = stage11d_nn_median_per_patient_detailed_um(final_data, base, phenos, palette)
+    stage11e_spatial_nn_maps_detailed_um(
+        final_data, dist_df, base,
+        max_rois=STAGE11E_MAX_ROIS,
+        min_tumour_cells=STAGE11E_MIN_TUMOUR_CELLS,
+        min_non_t_cells_with_dist=STAGE11E_MIN_NON_T_CELLS,
+        representative_per_patient=True,
+    )
+    stage11f_survival_stratified_nn_detailed_um(final_data, dist_df, med_df, clinical, base, phenos)
+
+    # ---- Stage 14 ----
+    print(">>> Stage 14 (Ripley + proximity, µm-native)")
+    stage14_ripley(final_data, clinical, area_lookup, base)
+    stage14b_tumour_caf_distance_um(final_data, clinical, base)
+    stage14c_first_neighbor_identity_um(final_data, clinical, base)
+    stage14d_caf_immune_proximity_um(final_data, clinical, base)
+    stage14g_tumour_immune_proximity_um(final_data, clinical, base)
+
+    print(">>> ✅ All done.")
+    print(f"Outputs: {base}")
+
+
+if __name__ == "__main__":
+    main()
