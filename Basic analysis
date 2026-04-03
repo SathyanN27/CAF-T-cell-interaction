@@ -1,0 +1,1806 @@
+import re
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.backends.backend_pdf import PdfPages
+
+from scipy.spatial import cKDTree
+from scipy.stats import mannwhitneyu, kruskal, wilcoxon
+import statsmodels.stats.multitest as smm
+
+# Global numeric heatmap colormap
+HEATMAP_CMAP = "RdBu_r"
+
+# Survival (KM + Cox + at-risk table)
+try:
+    from lifelines import KaplanMeierFitter, CoxPHFitter
+    from lifelines.statistics import multivariate_logrank_test
+    from lifelines.plotting import add_at_risk_counts
+    LIFELINES_OK = True
+except Exception:
+    LIFELINES_OK = False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def safe_name(x):
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(x))
+
+def _mw_pval(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if len(a) < 2 or len(b) < 2:
+        return np.nan
+    try:
+        return mannwhitneyu(a, b, alternative="two-sided")[1]
+    except Exception:
+        return np.nan
+
+def _paired_wilcoxon_p(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+
+    keep = np.isfinite(a) & np.isfinite(b)
+    a = a[keep]
+    b = b[keep]
+
+    if len(a) < 2 or len(b) < 2:
+        return np.nan, np.nan, len(a)
+
+    d = a - b
+    if np.allclose(d, 0, equal_nan=False):
+        return np.nan, np.nan, len(a)
+
+    try:
+        res = wilcoxon(a, b, zero_method="wilcox", alternative="two-sided")
+        p = float(res.pvalue)
+        stat = float(res.statistic)
+
+        z = getattr(res, "zstatistic", np.nan)
+        if z is not None and np.isfinite(z):
+            r = abs(float(z)) / np.sqrt(len(a))
+        else:
+            r = np.nan
+
+        return p, r, len(a)
+    except Exception:
+        return np.nan, np.nan, len(a)
+
+def _norm_core_id(v):
+    """Normalise Spot Id 2 so 142 and 142.0 match; keep non-numeric IDs as-is."""
+    if pd.isna(v):
+        return np.nan
+    s = str(v).strip()
+    try:
+        f = float(s)
+        if np.isfinite(f):
+            if abs(f - int(f)) < 1e-9:
+                return str(int(f))
+            return s
+    except Exception:
+        pass
+    return s
+
+def _clean_block_name(v):
+    if pd.isna(v):
+        return ""
+    s = str(v).strip()
+    if s.lower() in {"nan", "none"}:
+        return ""
+    return s
+
+def add_roi_key(df):
+    """
+    Build the most specific ROI key available.
+
+    Preferred:
+        ROI_KEY = Spot Id 1 + "__" + TMA Block Name + "__" + Spot Id 2
+    Fallback:
+        ROI_KEY = Spot Id 1 + "__" + Spot Id 2
+    """
+    d = df.copy()
+
+    if "Spot Id 1" not in d.columns or "Spot Id 2" not in d.columns:
+        return d
+
+    d["Spot Id 1"] = d["Spot Id 1"].astype(str).str.strip()
+    d["Spot Id 2"] = d["Spot Id 2"].apply(_norm_core_id)
+
+    if "TMA Block Name" in d.columns:
+        d["TMA Block Name"] = d["TMA Block Name"].apply(_clean_block_name)
+        use_block = d["TMA Block Name"].ne("")
+        d["ROI_KEY"] = np.where(
+            use_block,
+            d["Spot Id 1"].astype(str) + "__" + d["TMA Block Name"].astype(str) + "__" + d["Spot Id 2"].astype(str),
+            d["Spot Id 1"].astype(str) + "__" + d["Spot Id 2"].astype(str),
+        )
+    else:
+        d["ROI_KEY"] = d["Spot Id 1"].astype(str) + "__" + d["Spot Id 2"].astype(str)
+
+    return d
+
+def prepare_area_table(area_df, final_df):
+    """
+    Prepare Area.csv so densities map to the correct ROI.
+
+    Priority for mapping:
+      1) Spot Id 1 + TMA Block Name + Spot Id 2
+      2) Spot Id 1 + Spot Id 2
+      3) If Area.csv lacks Spot Id 1, infer it from final_df using the most specific available key
+
+    If duplicate area rows remain for the same ROI_KEY, collapse them using median(Total).
+    """
+    a = area_df.copy()
+    f = final_df.copy()
+
+    if "Spot Id 2" not in a.columns:
+        raise ValueError("Area.csv must contain 'Spot Id 2'.")
+    if "Total" not in a.columns:
+        raise ValueError("Area.csv must contain 'Total'.")
+
+    a["Spot Id 2"] = a["Spot Id 2"].apply(_norm_core_id)
+    a["Total"] = pd.to_numeric(a["Total"], errors="coerce")
+
+    if "Spot Id 1" in a.columns:
+        a["Spot Id 1"] = a["Spot Id 1"].astype(str).str.strip()
+    if "TMA Block Name" in a.columns:
+        a["TMA Block Name"] = a["TMA Block Name"].apply(_clean_block_name)
+
+    if "Spot Id 1" in a.columns:
+        a = add_roi_key(a)
+    else:
+        if "TMA Block Name" in a.columns and "TMA Block Name" in f.columns:
+            mapper = (
+                f[["Spot Id 1", "TMA Block Name", "Spot Id 2"]]
+                .drop_duplicates()
+                .copy()
+            )
+
+            amb = (
+                mapper.groupby(["TMA Block Name", "Spot Id 2"])["Spot Id 1"]
+                .nunique()
+            )
+            amb = amb[amb > 1]
+            if len(amb) > 0:
+                ex = [f"{idx[0]} | {idx[1]}" for idx in amb.index[:10]]
+                raise ValueError(
+                    "Could not infer patient ID uniquely from Area.csv using "
+                    "'TMA Block Name' + 'Spot Id 2'. Example ambiguous keys: "
+                    + ", ".join(ex)
+                )
+
+            a = a.merge(
+                mapper,
+                on=["TMA Block Name", "Spot Id 2"],
+                how="left",
+                validate="many_to_one",
+            )
+
+        else:
+            mapper = f[["Spot Id 1", "Spot Id 2"]].drop_duplicates().copy()
+
+            amb = mapper.groupby("Spot Id 2")["Spot Id 1"].nunique()
+            amb = amb[amb > 1]
+            if len(amb) > 0:
+                ex = amb.index.astype(str).tolist()[:10]
+                raise ValueError(
+                    "Area.csv does not contain 'Spot Id 1', and 'Spot Id 2' is "
+                    "not unique enough to infer patient ID. Example ambiguous "
+                    "Spot Id 2 values: " + ", ".join(ex)
+                )
+
+            a = a.merge(
+                mapper,
+                on="Spot Id 2",
+                how="left",
+                validate="many_to_one",
+            )
+
+        if "Spot Id 1" not in a.columns or a["Spot Id 1"].isna().any():
+            missing = a.loc[a["Spot Id 1"].isna(), "Spot Id 2"].astype(str).unique().tolist()[:10]
+            raise ValueError(
+                "Some Area.csv rows could not be mapped to a patient. "
+                "Example Spot Id 2 values: " + ", ".join(missing)
+            )
+
+        a = add_roi_key(a)
+
+    keep_cols = ["ROI_KEY", "Spot Id 1", "Spot Id 2", "Total"]
+    if "TMA Block Name" in a.columns:
+        keep_cols.insert(2, "TMA Block Name")
+
+    a = a[keep_cols].copy()
+
+    qc = (
+        a.groupby("ROI_KEY")
+        .agg(
+            **{
+                "Spot Id 1": ("Spot Id 1", "first"),
+                "Spot Id 2": ("Spot Id 2", "first"),
+                **({"TMA Block Name": ("TMA Block Name", "first")} if "TMA Block Name" in a.columns else {}),
+                "Total": ("Total", "median"),
+                "Area_n_rows": ("Total", "size"),
+                "Area_Total_min": ("Total", "min"),
+                "Area_Total_max": ("Total", "max"),
+            }
+        )
+        .reset_index()
+    )
+
+    n_conflict = int((qc["Area_Total_min"] != qc["Area_Total_max"]).sum())
+    if n_conflict > 0:
+        print(
+            f"WARNING: Area.csv had {n_conflict} ROI_KEY values with conflicting "
+            f"'Total' entries. Using median(Total) per ROI_KEY."
+        )
+
+    return qc
+
+def load_data(final_csv, area_csv, clin_csv):
+    final = pd.read_csv(final_csv)
+    area = pd.read_csv(area_csv)
+    clinical = pd.read_csv(clin_csv)
+
+    if "Spot Id 1" in final.columns:
+        final["Spot Id 1"] = final["Spot Id 1"].astype(str).str.strip()
+    if "Spot Id 2" in final.columns:
+        final["Spot Id 2"] = final["Spot Id 2"].apply(_norm_core_id)
+    if "TMA Block Name" in final.columns:
+        final["TMA Block Name"] = final["TMA Block Name"].apply(_clean_block_name)
+
+    if "Spot Id 1" in clinical.columns:
+        clinical["Spot Id 1"] = clinical["Spot Id 1"].astype(str).str.strip()
+
+    final = add_roi_key(final)
+    area = prepare_area_table(area, final)
+
+    return final, area, clinical
+
+def preprocess_clinical(df):
+    """
+    OS logic:
+    - OS days in 'Overall_Survival_(days)'.
+    - If OS is NA and Alive -> use 'Follow_up' (days).
+    - Event=1 if Deceased, Event=0 if Alive
+    - SurvivalCategory bins (days): Short<=540, Intermediate 541–900, Long>900
+    """
+    d = df.copy()
+
+    os_col = "Overall_Survival_(days)"
+    status_col = "Alive_or_deceased?"
+    fu_col = "Follow_up"
+
+    if os_col not in d.columns:
+        for c in d.columns:
+            if "Overall" in c and "Survival" in c and "day" in c.lower():
+                os_col = c
+                break
+    if status_col not in d.columns:
+        for c in d.columns:
+            if "alive" in c.lower() and "dece" in c.lower():
+                status_col = c
+                break
+    if fu_col not in d.columns:
+        for c in d.columns:
+            if "follow" in c.lower():
+                fu_col = c
+                break
+
+    d[os_col] = d[os_col].replace(["NA", "N/A", "na", "n/a", ""], np.nan)
+    d[fu_col] = d[fu_col].replace(["NA", "N/A", "na", "n/a", ""], np.nan)
+
+    d["OS_days_raw"] = pd.to_numeric(d[os_col], errors="coerce")
+    d["FollowUp_days_raw"] = pd.to_numeric(d[fu_col], errors="coerce")
+
+    status = d[status_col].astype(str).str.strip().str.lower()
+    is_alive = status.eq("alive")
+    is_deceased = status.eq("deceased")
+
+    d["SurvivalDays"] = d["OS_days_raw"].copy()
+    mask_need = d["SurvivalDays"].isna() & is_alive
+    d.loc[mask_need, "SurvivalDays"] = d.loc[mask_need, "FollowUp_days_raw"]
+
+    d["Event"] = np.where(is_deceased, 1, np.where(is_alive, 0, np.nan))
+
+    if "Spot Id 1" not in d.columns:
+        raise ValueError("Clinical file must contain 'Spot Id 1' patient ID column.")
+    d["Spot Id 1"] = d["Spot Id 1"].astype(str).str.strip()
+    d["SurvivalDays"] = pd.to_numeric(d["SurvivalDays"], errors="coerce")
+
+    d["SurvivalCategory"] = pd.cut(
+        d["SurvivalDays"],
+        bins=[-np.inf, 540, 900, np.inf],
+        labels=["Short", "Intermediate", "Long"],
+    )
+
+    return d[["Spot Id 1", "SurvivalDays", "Event", "SurvivalCategory"]].drop_duplicates()
+
+def save_boxplot(df, x, y, order, palette, outpath, title=None, xlabel=None, ylabel=None):
+    plt.figure(figsize=(max(6, len(order) * 0.45), 6))
+    sns.boxplot(x=x, y=y, data=df, order=order, palette=palette)
+    sns.stripplot(x=x, y=y, data=df, order=order, color="k", size=3, alpha=0.35, jitter=0.15)
+    plt.xticks(rotation=90)
+    if title:
+        plt.title(title)
+    if xlabel:
+        plt.xlabel(xlabel)
+    if ylabel:
+        plt.ylabel(ylabel)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+
+def save_triangle_corr_heatmap(corr_mat, outpath, title=None, cmap=HEATMAP_CMAP):
+    mat = corr_mat.copy()
+    mask = np.triu(np.ones_like(mat, dtype=bool), k=1)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(
+        mat,
+        mask=mask,
+        cmap=cmap,
+        square=True,
+        vmin=-1,
+        vmax=1,
+        center=0,
+        cbar_kws={"label": "Correlation"},
+    )
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+
+def save_heatmap(
+    mat,
+    outpath,
+    title=None,
+    cbar_label=None,
+    cmap=HEATMAP_CMAP,
+    square=True,
+    vmin=None,
+    vmax=None,
+    center=None,
+    xlabel=None,
+    ylabel=None,
+    xtick_rotation=90,
+    ytick_rotation=0,
+    annot=False,
+    fmt=".2f",
+):
+    plt.figure(figsize=(10, 8))
+    ax = sns.heatmap(
+        mat,
+        cmap=cmap,
+        square=square,
+        vmin=vmin,
+        vmax=vmax,
+        center=center,
+        cbar_kws={"label": cbar_label if cbar_label else ""},
+        annot=annot,
+        fmt=fmt if annot else None,
+    )
+    if title:
+        plt.title(title)
+    if xlabel is not None:
+        ax.set_xlabel(xlabel)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+    plt.xticks(rotation=xtick_rotation)
+    plt.yticks(rotation=ytick_rotation)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 1: Median Density (by Detailed_Phenotype)
+# ──────────────────────────────────────────────────────────────────────────────
+def stage1_median_density(final_data, area_data, outdir, group_order, palette_dict):
+    ensure_dir(outdir)
+
+    area_lookup = area_data[["ROI_KEY", "Total"]].drop_duplicates()
+
+    merged = final_data.merge(area_lookup, on="ROI_KEY", how="left")
+
+    cnt = (
+        merged.groupby(["Spot Id 1", "ROI_KEY", "Detailed_Phenotype"])
+        .size()
+        .reset_index(name="CellCount")
+    )
+    cnt = cnt.merge(area_lookup, on="ROI_KEY", how="left")
+    cnt["Density"] = cnt["CellCount"] / cnt["Total"]
+
+    df = cnt.groupby(["Spot Id 1", "Detailed_Phenotype"])["Density"].median().reset_index()
+
+    save_boxplot(
+        df,
+        "Detailed_Phenotype",
+        "Density",
+        group_order,
+        palette_dict,
+        Path(outdir) / "MedianDensity_Boxplot.png",
+        ylabel="Median Density (cells / area unit)",
+    )
+    return df
+
+def stage1_density_by_survival(df_density, clinical_df, outdir, group_order, surv_palette):
+    ensure_dir(outdir)
+    df = df_density.merge(clinical_df[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+    for ph in group_order:
+        sub = df[df["Detailed_Phenotype"] == ph].dropna(subset=["SurvivalCategory"])
+        if sub.empty:
+            continue
+        save_boxplot(
+            sub,
+            "SurvivalCategory",
+            "Density",
+            ["Short", "Intermediate", "Long"],
+            surv_palette,
+            Path(outdir) / f"{safe_name(ph)}_Density_BySurvival.png",
+            title=ph,
+            xlabel="Survival Category",
+            ylabel="Median Density",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 2: Median Proportion (by Detailed_Phenotype) + Short comparisons
+# ──────────────────────────────────────────────────────────────────────────────
+def stage2_median_proportion(final_data, outdir, group_order, palette_dict):
+    ensure_dir(outdir)
+
+    prop = (
+        final_data.groupby(["Spot Id 1", "ROI_KEY", "Detailed_Phenotype"])
+        .size()
+        .reset_index(name="CellCount")
+    )
+    tot = (
+        final_data.groupby(["Spot Id 1", "ROI_KEY"])
+        .size()
+        .reset_index(name="TotalCount")
+    )
+
+    merged = prop.merge(tot, on=["Spot Id 1", "ROI_KEY"], how="left")
+    merged["Proportion"] = merged["CellCount"] / merged["TotalCount"] * 100
+
+    df = (
+        merged.groupby(["Spot Id 1", "Detailed_Phenotype"])["Proportion"]
+        .median()
+        .reset_index(name="MedianProportion")
+    )
+
+    save_boxplot(
+        df,
+        "Detailed_Phenotype",
+        "MedianProportion",
+        group_order,
+        palette_dict,
+        Path(outdir) / "MedianProportion_Boxplot.png",
+        ylabel="Median Proportion (%)",
+    )
+    return df
+
+def stage2_proportion_by_survival(df_prop, clinical_df, outdir, group_order, surv_palette):
+    ensure_dir(outdir)
+    df = df_prop.merge(clinical_df[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+
+    stats_rows = []
+    for ph in group_order:
+        sub = df[df["Detailed_Phenotype"] == ph].dropna(subset=["SurvivalCategory"])
+        if sub.empty:
+            continue
+        s = sub.loc[sub["SurvivalCategory"] == "Short", "MedianProportion"].values
+        i = sub.loc[sub["SurvivalCategory"] == "Intermediate", "MedianProportion"].values
+        l = sub.loc[sub["SurvivalCategory"] == "Long", "MedianProportion"].values
+
+        p_si = _mw_pval(s, i)
+        p_sl = _mw_pval(s, l)
+
+        stats_rows.append({
+            "Detailed_Phenotype": ph,
+            "n_Short": int(np.isfinite(s).sum()),
+            "n_Intermediate": int(np.isfinite(i).sum()),
+            "n_Long": int(np.isfinite(l).sum()),
+            "MW_p_Short_vs_Intermediate": p_si,
+            "MW_p_Short_vs_Long": p_sl,
+        })
+
+    stats_df = pd.DataFrame(stats_rows)
+    stats_df.to_csv(Path(outdir) / "Stage2_Proportion_BySurvival_ShortComparisons.csv", index=False)
+
+    for ph in group_order:
+        sub = df[df["Detailed_Phenotype"] == ph].dropna(subset=["SurvivalCategory"])
+        if sub.empty:
+            continue
+
+        p_si = np.nan
+        p_sl = np.nan
+        if not stats_df.empty and ph in set(stats_df["Detailed_Phenotype"]):
+            row = stats_df.loc[stats_df["Detailed_Phenotype"] == ph].iloc[0]
+            p_si = row["MW_p_Short_vs_Intermediate"]
+            p_sl = row["MW_p_Short_vs_Long"]
+
+        title = ph
+        if np.isfinite(p_si) or np.isfinite(p_sl):
+            title = f"{ph}\nMWU p: Short vs Intermediate={p_si:.3g} | Short vs Long={p_sl:.3g}"
+
+        save_boxplot(
+            sub,
+            "SurvivalCategory",
+            "MedianProportion",
+            ["Short", "Intermediate", "Long"],
+            surv_palette,
+            Path(outdir) / f"{safe_name(ph)}_Proportion_BySurvival.png",
+            title=title,
+            xlabel="Survival Category",
+            ylabel="Median Proportion (%)",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 3: Correlation Heatmaps (triangle)
+# ──────────────────────────────────────────────────────────────────────────────
+def stage3_correlation(df_density, df_prop, group_order, outdir):
+    ensure_dir(outdir)
+    dp = (
+        df_density.pivot(index="Spot Id 1", columns="Detailed_Phenotype", values="Density")
+        .reindex(columns=group_order)
+        .fillna(0)
+    )
+    pp = (
+        df_prop.pivot(index="Spot Id 1", columns="Detailed_Phenotype", values="MedianProportion")
+        .reindex(columns=group_order)
+        .fillna(0)
+    )
+
+    save_triangle_corr_heatmap(
+        dp.corr(),
+        Path(outdir) / "Density_CorrHeatmap_TRI.png",
+        title="Density correlation (triangle)",
+        cmap=HEATMAP_CMAP,
+    )
+    save_triangle_corr_heatmap(
+        pp.corr(),
+        Path(outdir) / "Proportion_CorrHeatmap_TRI.png",
+        title="Proportion correlation (triangle)",
+        cmap=HEATMAP_CMAP,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 4: Mann–Whitney Tests (Detailed proportions by survival)
+# ──────────────────────────────────────────────────────────────────────────────
+def stage4_mannwhitney_detailed(df_prop, clinical_df, outdir):
+    ensure_dir(outdir)
+    sp = df_prop.merge(clinical_df[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+    rows = []
+    for ph, grp_df in sp.groupby("Detailed_Phenotype"):
+        grp = grp_df.dropna(subset=["SurvivalCategory"]).groupby("SurvivalCategory")["MedianProportion"].apply(list)
+        row = {"Phenotype": ph}
+        for a, b in [("Short", "Intermediate"), ("Short", "Long"), ("Intermediate", "Long")]:
+            row[f"{a}_vs_{b}"] = (
+                mannwhitneyu(grp.get(a, []), grp.get(b, []))[1]
+                if a in grp and b in grp and len(grp.get(a, [])) >= 2 and len(grp.get(b, [])) >= 2
+                else np.nan
+            )
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(Path(outdir) / "MannWhitney_Detailed.csv", index=False)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 5: Mann–Whitney Tests (per patient, proportions)
+# ──────────────────────────────────────────────────────────────────────────────
+def stage5_mannwhitney_per_spot(final_data, clinical_df, outdir):
+    ensure_dir(outdir)
+
+    prop = (
+        final_data.groupby(["Spot Id 1", "ROI_KEY", "Detailed_Phenotype"])
+        .size()
+        .reset_index(name="CellCount")
+    )
+    tot = (
+        final_data.groupby(["Spot Id 1", "ROI_KEY"])
+        .size()
+        .reset_index(name="TotalCount")
+    )
+    det = prop.merge(tot, on=["Spot Id 1", "ROI_KEY"], how="left")
+    det["Proportion"] = det["CellCount"] / det["TotalCount"] * 100
+
+    med = (
+        det.groupby(["Spot Id 1", "Detailed_Phenotype"])["Proportion"]
+        .median()
+        .reset_index(name="MedProp")
+    )
+
+    det_surv = med.merge(clinical_df[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+    rows = []
+    for ph, sub in det_surv.groupby("Detailed_Phenotype"):
+        grp = sub.dropna(subset=["SurvivalCategory"]).groupby("SurvivalCategory")["MedProp"].apply(list)
+        row = {"Phenotype": ph}
+        for a, b in [("Short", "Intermediate"), ("Short", "Long"), ("Intermediate", "Long")]:
+            row[f"{a}_vs_{b}"] = (
+                mannwhitneyu(grp.get(a, []), grp.get(b, []))[1]
+                if a in grp and b in grp and len(grp.get(a, [])) >= 2 and len(grp.get(b, [])) >= 2
+                else np.nan
+            )
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(Path(outdir) / "MannWhitney_PerPatient.csv", index=False)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 6: Juxta/Pan by nearest tumour-cell distance (NO MASK) + scatter plots
+# ──────────────────────────────────────────────────────────────────────────────
+def stage6_compartment_by_nn_tumour(
+    final_data,
+    outdir,
+    mic=0.325002431869506,
+    juxta_um=100.0,
+    tumour_min_neigh=5,
+    tumour_neigh_um=50.0,
+    make_scatter=True,
+    scatter_max_rois=None,
+):
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+    scatter_dir = outdir / "Stage6_ScatterROIs"
+    if make_scatter:
+        ensure_dir(scatter_dir)
+
+    df = final_data.copy()
+
+    df["DistToTumour_um"] = np.nan
+    df["DistBin"] = "NoTumour"
+    df["Compartment"] = "Panstromal"
+
+    bin_edges = [0, 50, 100, 200, 300, np.inf]
+    bin_labels = ["0–50 µm", "50–100 µm", "100–200 µm", "200–300 µm", ">300 µm"]
+
+    def is_tumour(sub):
+        return sub["Main_Cell_Type"].astype(str).str.strip().str.lower().eq("tumour")
+
+    def is_caf(sub):
+        return sub["Main_Cell_Type"].astype(str).str.strip().str.lower().eq("caf")
+
+    def is_immune(sub):
+        return sub["Main_Cell_Type"].astype(str).str.strip().str.lower().eq("immune")
+
+    qc_rows = []
+    plotted = 0
+
+    for roi_key, sub in df.groupby("ROI_KEY"):
+        sub_valid = sub.dropna(subset=["X", "Y"]).copy()
+        if sub_valid.empty:
+            continue
+
+        idx = sub_valid.index.values
+        coords_all_px = sub_valid[["X", "Y"]].to_numpy(dtype=float)
+
+        patient_id = sub_valid["Spot Id 1"].iloc[0] if "Spot Id 1" in sub_valid.columns else np.nan
+        spot_id = sub_valid["Spot Id 2"].iloc[0] if "Spot Id 2" in sub_valid.columns else np.nan
+        block_name = sub_valid["TMA Block Name"].iloc[0] if "TMA Block Name" in sub_valid.columns else ""
+
+        tum = sub_valid[is_tumour(sub_valid)].copy()
+        if tum.empty:
+            qc_rows.append({
+                "ROI_KEY": roi_key,
+                "Spot Id 1": patient_id,
+                "TMA Block Name": block_name,
+                "Spot Id 2": spot_id,
+                "n_cells_total": int(len(sub_valid)),
+                "n_tumour_total": 0,
+                "n_tumour_kept": 0,
+                "n_juxta": 0,
+                "n_panstromal": int(len(sub_valid)),
+                "status": "NO_TUMOUR",
+            })
+            continue
+
+        tum_coords_px = tum[["X", "Y"]].to_numpy(dtype=float)
+        tum_tree = cKDTree(tum_coords_px)
+
+        tumour_neigh_px = tumour_neigh_um / mic
+        neigh_lists = tum_tree.query_ball_point(tum_coords_px, r=tumour_neigh_px)
+        neigh_counts = np.array([len(nl) - 1 for nl in neigh_lists], dtype=int)
+        keep_tum = neigh_counts >= tumour_min_neigh
+
+        tum_kept = tum.loc[tum.index.values[keep_tum]].copy()
+        if tum_kept.empty:
+            qc_rows.append({
+                "ROI_KEY": roi_key,
+                "Spot Id 1": patient_id,
+                "TMA Block Name": block_name,
+                "Spot Id 2": spot_id,
+                "n_cells_total": int(len(sub_valid)),
+                "n_tumour_total": int(len(tum)),
+                "n_tumour_kept": 0,
+                "n_juxta": 0,
+                "n_panstromal": int(len(sub_valid)),
+                "status": "TUMOUR_FILTER_REMOVED_ALL",
+            })
+            continue
+
+        tree = cKDTree(tum_kept[["X", "Y"]].to_numpy(dtype=float))
+        d_px, _ = tree.query(coords_all_px, k=1)
+        d_um = d_px * mic
+
+        df.loc[idx, "DistToTumour_um"] = d_um
+        df.loc[idx, "DistBin"] = pd.cut(
+            d_um,
+            bins=bin_edges,
+            labels=bin_labels,
+            include_lowest=True
+        ).astype(object)
+
+        comp = np.where(d_um < juxta_um, "Juxtatumoural", "Panstromal").astype(object)
+        df.loc[idx, "Compartment"] = comp
+
+        n_juxta = int(np.sum(comp == "Juxtatumoural"))
+        n_pan = int(np.sum(comp == "Panstromal"))
+
+        qc_rows.append({
+            "ROI_KEY": roi_key,
+            "Spot Id 1": patient_id,
+            "TMA Block Name": block_name,
+            "Spot Id 2": spot_id,
+            "n_cells_total": int(len(sub_valid)),
+            "n_tumour_total": int(len(tum)),
+            "n_tumour_kept": int(len(tum_kept)),
+            "n_juxta": n_juxta,
+            "n_panstromal": n_pan,
+            "status": "OK",
+        })
+
+        if make_scatter and (scatter_max_rois is None or plotted < scatter_max_rois):
+            s = sub_valid.copy()
+            s["Compartment"] = comp
+
+            mask_t = is_tumour(s)
+
+            mask_i = is_immune(s)
+            mask_i_j = mask_i & (s["Compartment"] == "Juxtatumoural")
+            mask_i_p = mask_i & (s["Compartment"] == "Panstromal")
+
+            mask_c = is_caf(s)
+            mask_c_j = mask_c & (s["Compartment"] == "Juxtatumoural")
+            mask_c_p = mask_c & (s["Compartment"] == "Panstromal")
+
+            mask_other = ~(mask_t | mask_i | mask_c)
+
+            plt.figure(figsize=(6.5, 6.5))
+            if mask_other.any():
+                plt.scatter(
+                    s.loc[mask_other, "X"],
+                    s.loc[mask_other, "Y"],
+                    s=4,
+                    c="lightgrey",
+                    alpha=0.35,
+                    linewidths=0,
+                )
+
+            if mask_i_p.any():
+                plt.scatter(
+                    s.loc[mask_i_p, "X"],
+                    s.loc[mask_i_p, "Y"],
+                    s=6,
+                    c="green",
+                    alpha=0.8,
+                    linewidths=0,
+                    label="Panstromal Immune",
+                )
+            if mask_c_p.any():
+                plt.scatter(
+                    s.loc[mask_c_p, "X"],
+                    s.loc[mask_c_p, "Y"],
+                    s=6,
+                    c="orange",
+                    alpha=0.85,
+                    linewidths=0,
+                    label="Panstromal CAF",
+                )
+            if mask_i_j.any():
+                plt.scatter(
+                    s.loc[mask_i_j, "X"],
+                    s.loc[mask_i_j, "Y"],
+                    s=7,
+                    c="red",
+                    alpha=0.85,
+                    linewidths=0,
+                    label="Juxtatumoural Immune",
+                )
+            if mask_c_j.any():
+                plt.scatter(
+                    s.loc[mask_c_j, "X"],
+                    s.loc[mask_c_j, "Y"],
+                    s=7,
+                    c="yellow",
+                    alpha=0.9,
+                    linewidths=0,
+                    label="Juxtatumoural CAF",
+                )
+            if mask_t.any():
+                plt.scatter(
+                    s.loc[mask_t, "X"],
+                    s.loc[mask_t, "Y"],
+                    s=12,
+                    c="blue",
+                    alpha=0.95,
+                    linewidths=0,
+                    label="Tumour",
+                )
+
+            plt.gca().invert_yaxis()
+            plt.axis("equal")
+            plt.xticks([])
+            plt.yticks([])
+
+            title_bits = [f"Patient {patient_id}"]
+            if str(block_name).strip() not in ["", "nan", "None"]:
+                title_bits.append(f"Block {block_name}")
+            title_bits.append(f"ROI {spot_id}")
+            title_bits.append(f"tumour kept={len(tum_kept)}")
+            title_bits.append(f"juxta={n_juxta} pan={n_pan}")
+            plt.title(" | ".join(title_bits))
+
+            plt.legend(loc="best", fontsize=8, frameon=True)
+            plt.tight_layout()
+            plt.savefig(
+                scatter_dir / (
+                    f"Stage6_Scatter_{safe_name(patient_id)}_"
+                    f"{safe_name(block_name)}_{safe_name(spot_id)}.png"
+                ),
+                dpi=300,
+            )
+            plt.close()
+            plotted += 1
+
+    qc_df = pd.DataFrame(qc_rows)
+    qc_df.to_csv(outdir / "Stage6_QC_PerROI.csv", index=False)
+
+    summary = {
+        "mic_um_per_px": mic,
+        "juxta_um": juxta_um,
+        "tumour_neigh_um": tumour_neigh_um,
+        "tumour_min_neigh": tumour_min_neigh,
+        "n_rois": int(qc_df.shape[0]),
+        "n_rois_ok": int((qc_df["status"] == "OK").sum()) if not qc_df.empty else 0,
+        "n_rois_no_tumour": int((qc_df["status"] == "NO_TUMOUR").sum()) if not qc_df.empty else 0,
+        "total_cells": int(qc_df["n_cells_total"].sum()) if not qc_df.empty else 0,
+        "total_tumour_total": int(qc_df["n_tumour_total"].sum()) if not qc_df.empty else 0,
+        "total_tumour_kept": int(qc_df["n_tumour_kept"].sum()) if not qc_df.empty else 0,
+        "total_juxta": int(qc_df["n_juxta"].sum()) if not qc_df.empty else 0,
+        "total_panstromal": int(qc_df["n_panstromal"].sum()) if not qc_df.empty else 0,
+    }
+    pd.DataFrame([summary]).to_csv(outdir / "Stage6_QC_Summary.csv", index=False)
+
+    qc_hist_dir = outdir / "QC_Histograms"
+    ensure_dir(qc_hist_dir)
+
+    dvals = df["DistToTumour_um"].to_numpy(dtype=float)
+    dvals = dvals[np.isfinite(dvals)]
+    if dvals.size > 0:
+        bins_um = np.arange(0, 801, 25)
+
+        plt.figure(figsize=(7, 4))
+        plt.hist(dvals, bins=bins_um)
+        plt.xlabel("Distance to nearest tumour cell (µm)")
+        plt.ylabel("Number of cells")
+        plt.title("Stage 6 QC: DistToTumour_um (all finite)")
+        plt.tight_layout()
+        plt.savefig(qc_hist_dir / "Stage6_QC_Hist_AllCells.png", dpi=300)
+        plt.close()
+
+        plt.figure(figsize=(7, 4))
+        for comp_ in ["Juxtatumoural", "Panstromal"]:
+            subd = df.loc[df["Compartment"] == comp_, "DistToTumour_um"].to_numpy(dtype=float)
+            subd = subd[np.isfinite(subd)]
+            if subd.size == 0:
+                continue
+            plt.hist(subd, bins=bins_um, alpha=0.5, label=f"{comp_} (n={subd.size})")
+        plt.xlabel("Distance to nearest tumour cell (µm)")
+        plt.ylabel("Number of cells")
+        plt.title("Stage 6 QC: DistToTumour_um by compartment")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(qc_hist_dir / "Stage6_QC_Hist_ByCompartment.png", dpi=300)
+        plt.close()
+
+    return df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 7: remove tumour states from PANSTROMAL compartment only
+# ──────────────────────────────────────────────────────────────────────────────
+STAGE7_PANSTROMAL_EXCLUDE = {"Hypoxic", "Normoxic"}
+
+
+def _drop_panstromal_tumour_states(df):
+    df = df.copy()
+    mask = (
+        df["Compartment"].eq("Panstromal") &
+        df["Detailed_Phenotype"].isin(STAGE7_PANSTROMAL_EXCLUDE)
+    )
+    n_drop = int(mask.sum())
+    if n_drop > 0:
+        print(f"Stage 7: dropping {n_drop} panstromal tumour-state rows "
+              f"({sorted(STAGE7_PANSTROMAL_EXCLUDE)})")
+    return df.loc[~mask].copy()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 7: Within-compartment proportions
+# denominator = all remaining cells in that compartment
+# NOTE:
+#   - Hypoxic/Normoxic are removed from PANSTROMAL only
+#   - therefore panstromal denominators are recalculated after removal
+# ──────────────────────────────────────────────────────────────────────────────
+def stage7_within_compartment_composition(
+    final_data,
+    outdir,
+    group_order,
+    summarise="median",
+    make_patient_delta_heatmap=True,
+):
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+    indiv_dir = outdir / "IndividualPhenotypes"
+    ensure_dir(indiv_dir)
+
+    df = final_data.copy()
+    df = df[df["Compartment"].isin(["Juxtatumoural", "Panstromal"])].copy()
+    df = df.dropna(subset=["Spot Id 1", "ROI_KEY", "Detailed_Phenotype"])
+    if df.empty:
+        print("Stage 7: no Juxtatumoural/Panstromal rows found.")
+        return pd.DataFrame()
+
+    # Remove tumour states from PANSTROMAL only
+    df = _drop_panstromal_tumour_states(df)
+
+    if df.empty:
+        print("Stage 7: no rows remain after panstromal tumour-state exclusion.")
+        return pd.DataFrame()
+
+    # Phenotypes that still make sense for paired Juxta-vs-Pan comparison
+    compare_order = [ph for ph in group_order if ph not in STAGE7_PANSTROMAL_EXCLUDE]
+
+    # ROI-level counts and denominators
+    cnt = (
+        df.groupby(["Spot Id 1", "ROI_KEY", "Compartment", "Detailed_Phenotype"])
+        .size()
+        .reset_index(name="N_ph")
+    )
+    den = (
+        df.groupby(["Spot Id 1", "ROI_KEY", "Compartment"])
+        .size()
+        .reset_index(name="N_comp")
+    )
+
+    roi_frac = cnt.merge(den, on=["Spot Id 1", "ROI_KEY", "Compartment"], how="left")
+    roi_frac["FracWithinCompartment"] = roi_frac["N_ph"] / roi_frac["N_comp"]
+    roi_frac.to_csv(outdir / "Stage7_ROI_WithinCompartmentFractions.csv", index=False)
+
+    aggfunc = np.median if summarise.lower() == "median" else np.mean
+    pt_frac = (
+        roi_frac.groupby(["Spot Id 1", "Compartment", "Detailed_Phenotype"])["FracWithinCompartment"]
+        .apply(aggfunc)
+        .reset_index(name="FracWithinCompartment")
+    )
+    pt_frac.to_csv(outdir / "Stage7_Patient_WithinCompartmentFractions.csv", index=False)
+
+    # -------------------------------------------------------------------------
+    # Individual paired boxplots
+    # Skip Hypoxic/Normoxic because Pan values were deliberately removed
+    # -------------------------------------------------------------------------
+    for ph in compare_order:
+        sub = pt_frac[pt_frac["Detailed_Phenotype"] == ph].copy()
+        if sub.empty:
+            continue
+
+        piv = (
+            sub.pivot(index="Spot Id 1", columns="Compartment", values="FracWithinCompartment")
+            .reindex(columns=["Juxtatumoural", "Panstromal"])
+        )
+
+        df_long = piv.reset_index().melt(
+            id_vars="Spot Id 1",
+            value_vars=["Juxtatumoural", "Panstromal"],
+            var_name="Compartment",
+            value_name="FracWithinCompartment",
+        )
+
+        plt.figure(figsize=(5.5, 5))
+        sns.boxplot(
+            data=df_long,
+            x="Compartment",
+            y="FracWithinCompartment",
+            order=["Juxtatumoural", "Panstromal"],
+            palette={"Juxtatumoural": "#377eb8", "Panstromal": "#e41a1c"},
+        )
+        sns.stripplot(
+            data=df_long,
+            x="Compartment",
+            y="FracWithinCompartment",
+            order=["Juxtatumoural", "Panstromal"],
+            color="k",
+            alpha=0.45,
+            size=3,
+            jitter=0.15,
+        )
+
+        both = piv.dropna(subset=["Juxtatumoural", "Panstromal"])
+        for _, row in both.iterrows():
+            plt.plot(
+                [0, 1],
+                [row["Juxtatumoural"], row["Panstromal"]],
+                color="grey",
+                alpha=0.25,
+                linewidth=1,
+            )
+
+        plt.title(f"{ph} — within-compartment fraction (per patient)")
+        plt.ylabel("Fraction within compartment")
+        plt.xlabel("")
+        plt.tight_layout()
+        plt.savefig(indiv_dir / f"Stage7_{safe_name(ph)}_Juxta_vs_Pan.png", dpi=300)
+        plt.close()
+
+    # -------------------------------------------------------------------------
+    # Main heatmap
+    # Keep full group_order so Hypoxic/Normoxic still appear for Juxta,
+    # but their Panstromal cells will be blank/NaN
+    # -------------------------------------------------------------------------
+    med_by_comp = (
+        pt_frac.groupby(["Detailed_Phenotype", "Compartment"])["FracWithinCompartment"]
+        .median()
+        .reset_index()
+    )
+    heat = (
+        med_by_comp.pivot(index="Detailed_Phenotype", columns="Compartment", values="FracWithinCompartment")
+        .reindex(index=group_order, columns=["Juxtatumoural", "Panstromal"])
+    )
+
+    plt.figure(figsize=(6, max(5, 0.25 * len(group_order))))
+    sns.heatmap(
+        heat,
+        cmap="RdBu_r",
+        vmin=0,
+        vmax=0.125,
+        annot=False,
+        linewidths=0.5,
+    )
+    plt.title("Stage 7 — median within-compartment fraction (across patients)")
+    plt.xlabel("Compartment")
+    plt.ylabel("Detailed_Phenotype")
+    plt.tight_layout()
+    plt.savefig(outdir / "Stage7_MedianFraction_ByCompartment_Heatmap.png", dpi=300)
+    plt.close()
+
+    # -------------------------------------------------------------------------
+    # Patient delta heatmap
+    # Exclude Hypoxic/Normoxic because Pan values were removed
+    # -------------------------------------------------------------------------
+    if make_patient_delta_heatmap:
+        user_exclude_patients = {
+            "C02P102",
+            "Patient 112",
+            "Patient 157",
+            "Patient 16",
+            "Patient 35",
+        }
+
+        piv2 = (
+            pt_frac[pt_frac["Detailed_Phenotype"].isin(compare_order)]
+            .pivot_table(
+                index=["Spot Id 1", "Detailed_Phenotype"],
+                columns="Compartment",
+                values="FracWithinCompartment",
+                aggfunc="first",
+            )
+            .reset_index()
+        )
+
+        piv2["Delta_JuxtaMinusPan"] = (
+            piv2.get("Juxtatumoural", np.nan) - piv2.get("Panstromal", np.nan)
+        )
+
+        delta = (
+            piv2.pivot(index="Spot Id 1", columns="Detailed_Phenotype", values="Delta_JuxtaMinusPan")
+            .reindex(columns=compare_order)
+        )
+
+        auto_blank_patients = set(delta.index[delta.isna().all(axis=1)].astype(str))
+        present_patients = set(delta.index.astype(str))
+        manual_excluded_present = user_exclude_patients & present_patients
+
+        excluded_rows = []
+        for p in sorted(auto_blank_patients):
+            excluded_rows.append({"Spot Id 1": p, "Reason": "All values missing"})
+        for p in sorted(manual_excluded_present - auto_blank_patients):
+            excluded_rows.append({"Spot Id 1": p, "Reason": "User-requested exclusion"})
+
+        delta_plot = delta.dropna(axis=0, how="all").copy()
+        delta_plot = delta_plot.loc[
+            ~delta_plot.index.astype(str).isin(user_exclude_patients)
+        ].copy()
+
+        delta_plot.to_csv(outdir / "Stage7_PatientDelta_JuxtaMinusPan_FILTERED.csv")
+        pd.DataFrame(excluded_rows).to_csv(
+            outdir / "Stage7_PatientDelta_ExcludedPatients.csv",
+            index=False
+        )
+
+        if not delta_plot.empty:
+            plt.figure(figsize=(12, max(5, 0.22 * delta_plot.shape[0])))
+            sns.heatmap(delta_plot, cmap="RdBu_r", center=0, linewidths=0.3)
+            plt.title("Stage 7 — patient delta (Juxta − Pan) within-compartment fractions")
+            plt.xlabel("Detailed_Phenotype")
+            plt.ylabel("Spot Id 1")
+            plt.tight_layout()
+            plt.savefig(outdir / "Stage7_PatientDelta_JuxtaMinusPan_Heatmap.png", dpi=300)
+            plt.close()
+        else:
+            print("Stage 7 delta heatmap: no rows remain after exclusions.")
+
+        piv2.to_csv(outdir / "Stage7_PatientDelta_JuxtaMinusPan.csv", index=False)
+
+    return pt_frac
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 7: paired Juxta vs Pan stats
+# Excludes Hypoxic/Normoxic because Pan values were deliberately removed
+# ──────────────────────────────────────────────────────────────────────────────
+def stage7_juxta_vs_pan_stats(pt_frac, outdir, group_order):
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+
+    compare_order = [ph for ph in group_order if ph not in STAGE7_PANSTROMAL_EXCLUDE]
+    rows = []
+
+    for ph in compare_order:
+        sub = pt_frac[pt_frac["Detailed_Phenotype"] == ph].copy()
+        if sub.empty:
+            rows.append({
+                "Detailed_Phenotype": ph,
+                "n_paired_patients": 0,
+                "wilcoxon_p": np.nan,
+                "median_delta_JuxtaMinusPan": np.nan,
+                "mean_delta_JuxtaMinusPan": np.nan,
+                "r_effect_if_available": np.nan,
+            })
+            continue
+
+        piv = (
+            sub.pivot(index="Spot Id 1", columns="Compartment", values="FracWithinCompartment")
+            .reindex(columns=["Juxtatumoural", "Panstromal"])
+        )
+
+        paired = piv.dropna(subset=["Juxtatumoural", "Panstromal"]).copy()
+        if paired.empty:
+            rows.append({
+                "Detailed_Phenotype": ph,
+                "n_paired_patients": 0,
+                "wilcoxon_p": np.nan,
+                "median_delta_JuxtaMinusPan": np.nan,
+                "mean_delta_JuxtaMinusPan": np.nan,
+                "r_effect_if_available": np.nan,
+            })
+            continue
+
+        a = paired["Juxtatumoural"].to_numpy(dtype=float)
+        b = paired["Panstromal"].to_numpy(dtype=float)
+        delta = a - b
+
+        p, r, n = _paired_wilcoxon_p(a, b)
+
+        rows.append({
+            "Detailed_Phenotype": ph,
+            "n_paired_patients": int(n),
+            "wilcoxon_p": p,
+            "median_delta_JuxtaMinusPan": float(np.nanmedian(delta)),
+            "mean_delta_JuxtaMinusPan": float(np.nanmean(delta)),
+            "r_effect_if_available": r,
+        })
+
+    res_df = pd.DataFrame(rows)
+
+    res_df["wilcoxon_p_FDR"] = np.nan
+    valid = res_df["wilcoxon_p"].notna()
+    if valid.any():
+        res_df.loc[valid, "wilcoxon_p_FDR"] = smm.multipletests(
+            res_df.loc[valid, "wilcoxon_p"],
+            method="fdr_bh"
+        )[1]
+
+    res_df.to_csv(outdir / "Stage7_Juxta_vs_Pan_Stats.csv", index=False)
+    return res_df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 7b: Compartment-specific correlation heatmaps (SPEARMAN)
+# Uses WITHIN-COMPARTMENT PROPORTIONS, not density
+# Remove Hypoxic/Normoxic from PANSTROMAL only
+# NOTE:
+#   area_data is kept in the signature for compatibility with main(), but is
+#   not used here because compartment-specific area is not available.
+# ──────────────────────────────────────────────────────────────────────────────
+def stage7b_corr_heatmaps(final_data, group_order, area_data, outdir):
+    ensure_dir(outdir)
+    outdir = Path(outdir)
+
+    df = final_data.copy()
+    df = df[df["Compartment"].isin(["Juxtatumoural", "Panstromal"])].copy()
+    df = df.dropna(subset=["Spot Id 1", "ROI_KEY", "Detailed_Phenotype"])
+
+    if df.empty:
+        print("Stage 7b: no Juxtatumoural/Panstromal rows found.")
+        return
+
+    # Remove tumour states from PANSTROMAL only
+    df = _drop_panstromal_tumour_states(df)
+
+    if df.empty:
+        print("Stage 7b: no rows remain after panstromal tumour-state exclusion.")
+        return
+
+    juxta_order = list(group_order)
+    pan_order = [ph for ph in group_order if ph not in STAGE7_PANSTROMAL_EXCLUDE]
+
+    # -------------------------------------------------------------------------
+    # Build ROI-level within-compartment fractions
+    # denominator = all cells in that compartment within that ROI
+    # -------------------------------------------------------------------------
+    cnt = (
+        df.groupby(["Spot Id 1", "ROI_KEY", "Compartment", "Detailed_Phenotype"])
+        .size()
+        .reset_index(name="N_ph")
+    )
+    den = (
+        df.groupby(["Spot Id 1", "ROI_KEY", "Compartment"])
+        .size()
+        .reset_index(name="N_comp")
+    )
+
+    roi_frac = cnt.merge(den, on=["Spot Id 1", "ROI_KEY", "Compartment"], how="left")
+    roi_frac["FracWithinCompartment"] = roi_frac["N_ph"] / roi_frac["N_comp"]
+
+    roi_frac.to_csv(outdir / "7b_ROI_WithinCompartmentFractions_ForCorrelation.csv", index=False)
+
+    # -------------------------------------------------------------------------
+    # Patient-level median across ROIs
+    # -------------------------------------------------------------------------
+    pt_frac = (
+        roi_frac.groupby(["Spot Id 1", "Compartment", "Detailed_Phenotype"])["FracWithinCompartment"]
+        .median()
+        .reset_index(name="FracWithinCompartment")
+    )
+
+    pt_frac.to_csv(outdir / "7b_PatientMedian_WithinCompartmentFractions_ForCorrelation.csv", index=False)
+
+    def comp_df(label_, phenotype_order):
+        sub = pt_frac[pt_frac["Compartment"] == label_].copy()
+        if sub.empty:
+            return pd.DataFrame(index=[], columns=phenotype_order).fillna(0)
+
+        return (
+            sub.pivot(index="Spot Id 1", columns="Detailed_Phenotype", values="FracWithinCompartment")
+            .reindex(columns=phenotype_order)
+            .fillna(0)
+        )
+
+    pj = comp_df("Juxtatumoural", juxta_order)
+    pp = comp_df("Panstromal", pan_order)
+
+    # -------------------------------------------------------------------------
+    # A) Juxtatumoural — Spearman correlation
+    # -------------------------------------------------------------------------
+    juxta_corr = pj.corr(method="spearman")
+    save_triangle_corr_heatmap(
+        juxta_corr,
+        outdir / "7b_Corr_Juxtatumoural_TRI.png",
+        title="7b.1 Juxtatumoural (Spearman, within-compartment fraction)",
+        cmap=HEATMAP_CMAP,
+    )
+
+    juxta_corr.to_csv(outdir / "7b_Corr_Juxtatumoural_TRI.csv")
+
+    # -------------------------------------------------------------------------
+    # B) Panstromal — Spearman correlation
+    # -------------------------------------------------------------------------
+    pan_corr = pp.corr(method="spearman")
+    save_triangle_corr_heatmap(
+        pan_corr,
+        outdir / "7b_Corr_Panstromal_TRI.png",
+        title="7b.2 Panstromal (Spearman, within-compartment fraction)",
+        cmap=HEATMAP_CMAP,
+    )
+
+    pan_corr.to_csv(outdir / "7b_Corr_Panstromal_TRI.csv")
+
+    # -------------------------------------------------------------------------
+    # C) Cross-compartment — Spearman correlation
+    # rows    = Panstromal phenotypes
+    # columns = Juxtatumoural phenotypes
+    # -------------------------------------------------------------------------
+    cross = pd.DataFrame(index=pan_order, columns=juxta_order, dtype=float)
+    for ph_p in pan_order:
+        for ph_j in juxta_order:
+            cross.loc[ph_p, ph_j] = pj[ph_j].corr(pp[ph_p], method="spearman")
+
+    save_heatmap(
+        cross,
+        outdir / "7b_Corr_Cross_Juxta_vs_Panstromal.png",
+        title="7b.3 Cross-Compartment (Spearman, within-compartment fraction)",
+        cbar_label="Spearman correlation",
+        cmap=HEATMAP_CMAP,
+        square=False,
+        vmin=-1,
+        vmax=1,
+        center=0,
+        xlabel="Juxtatumoural phenotype (within-compartment fraction)",
+        ylabel="Panstromal phenotype (within-compartment fraction)",
+        xtick_rotation=90,
+        ytick_rotation=0,
+        annot=False,
+    )
+
+    cross.to_csv(outdir / "7b_Corr_Cross_Juxta_vs_Panstromal.csv")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 8a: Distance-bin quadrants + patient proportions per quadrant
+# ──────────────────────────────────────────────────────────────────────────────
+def stage8a_quadrant_scatter(final_data, outdir, group_order, near_bins=None, far_bins=None):
+    ensure_dir(outdir)
+    outdir = Path(outdir)
+
+    if near_bins is None:
+        near_bins = ["0–50 µm", "50–100 µm"]
+    if far_bins is None:
+        far_bins = ["100–200 µm", "200–300 µm", ">300 µm"]
+
+    df = final_data.copy()
+    df = df.dropna(subset=["DistBin"])
+    df = df[df["DistBin"] != "NoTumour"]
+
+    if df.empty:
+        print("Stage 8a: no rows with defined DistBin (tumour absent everywhere).")
+        return pd.DataFrame()
+
+    frac_all = df.groupby(["Spot Id 1", "Detailed_Phenotype"]).size().reset_index(name="Count")
+    frac_tot = df.groupby("Spot Id 1").size().reset_index(name="Total")
+    ov = frac_all.merge(frac_tot, on="Spot Id 1")
+    ov["OverallFraction"] = ov["Count"] / ov["Total"]
+
+    near_df = df[df["DistBin"].isin(near_bins)]
+    near_counts = near_df.groupby(["Spot Id 1", "Detailed_Phenotype"]).size().reset_index(name="NearCount")
+
+    far_df = df[df["DistBin"].isin(far_bins)]
+    far_counts = far_df.groupby(["Spot Id 1", "Detailed_Phenotype"]).size().reset_index(name="FarCount")
+
+    prox = near_counts.merge(far_counts, on=["Spot Id 1", "Detailed_Phenotype"], how="outer").fillna(0)
+    prox["TotalNF"] = prox["NearCount"] + prox["FarCount"]
+    prox = prox[prox["TotalNF"] > 0]
+    if prox.empty:
+        print("Stage 8a: no cells fall into near/far bins.")
+        return pd.DataFrame()
+
+    prox["ProximalFraction"] = prox["NearCount"] / prox["TotalNF"]
+
+    merged = ov.merge(
+        prox[["Spot Id 1", "Detailed_Phenotype", "ProximalFraction"]],
+        on=["Spot Id 1", "Detailed_Phenotype"],
+        how="inner",
+    )
+
+    rows = []
+    pdf = PdfPages(outdir / "QuadrantPlots_DistBins.pdf")
+
+    for ph in group_order:
+        sub = merged[merged["Detailed_Phenotype"] == ph]
+        if sub.empty:
+            continue
+
+        med_overall = sub["OverallFraction"].median()
+        med_prox = sub["ProximalFraction"].median()
+
+        for _, r in sub.iterrows():
+            x = r["OverallFraction"] - med_overall
+            y = r["ProximalFraction"] - med_prox
+
+            if x > 0 and y > 0:
+                quad = "High infiltration Included"
+            elif x < 0 and y > 0:
+                quad = "Low infiltration Included"
+            elif x < 0 and y < 0:
+                quad = "Low infiltration Excluded"
+            else:
+                quad = "High infiltration Excluded"
+
+            rows.append({
+                "Spot Id 1": r["Spot Id 1"],
+                "Detailed_Phenotype": ph,
+                "OverallFraction": r["OverallFraction"],
+                "ProximalFraction": r["ProximalFraction"],
+                "OverallCentered": x,
+                "ProximalCentered": y,
+                "Quadrant": quad,
+            })
+
+        d_plot = sub.copy()
+        d_plot["OverallCentered"] = d_plot["OverallFraction"] - med_overall
+        d_plot["ProximalCentered"] = d_plot["ProximalFraction"] - med_prox
+
+        plt.figure(figsize=(5, 5))
+        sns.scatterplot(x="OverallCentered", y="ProximalCentered", data=d_plot)
+        plt.axhline(0, ls="--", color="grey")
+        plt.axvline(0, ls="--", color="grey")
+        plt.title(ph)
+        plt.xlabel("Overall fraction (centered per phenotype)")
+        plt.ylabel("Proximal fraction (0–100 µm, centered)")
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+    pdf.close()
+
+    quad_df = pd.DataFrame(rows)
+    if quad_df.empty:
+        return quad_df
+
+    quads_order = [
+        "Low infiltration Included",
+        "High infiltration Included",
+        "Low infiltration Excluded",
+        "High infiltration Excluded",
+    ]
+    counts = (
+        quad_df.groupby(["Detailed_Phenotype", "Quadrant"])["Spot Id 1"]
+        .nunique()
+        .unstack(fill_value=0)
+        .reindex(columns=quads_order, fill_value=0)
+    )
+    props = counts.div(counts.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+
+    counts.to_csv(outdir / "Stage8a_Quadrant_PatientCounts_ByPhenotype.csv")
+    props.to_csv(outdir / "Stage8a_Quadrant_PatientProportions_ByPhenotype.csv")
+
+    plt.figure(figsize=(10, max(4, len(props) * 0.35)))
+    sns.heatmap(props, annot=True, fmt=".2f", cmap=HEATMAP_CMAP, vmin=0, vmax=1, linewidths=0.5)
+    plt.title("Stage 8a: Proportion of patients in each quadrant (per phenotype)")
+    plt.xlabel("Quadrant")
+    plt.ylabel("Detailed_Phenotype")
+    plt.tight_layout()
+    plt.savefig(outdir / "Stage8a_Quadrant_PatientProportions_Heatmap.png", dpi=300)
+    plt.close()
+
+    quad_df.to_csv(outdir / "Stage8a_Quadrant_Assignments.csv", index=False)
+    return quad_df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 8b: Kaplan–Meier per phenotype (quadrants) + Cox HRs + at-risk table
+# ──────────────────────────────────────────────────────────────────────────────
+def stage8b_km_by_quadrant(
+    quad_df,
+    clinical_df,
+    outdir,
+    group_order,
+    time_col="SurvivalDays",
+    event_col="Event",
+):
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+
+    if not LIFELINES_OK:
+        print("Stage 8b: lifelines not installed/available. Skipping KM + forest plots.")
+        return
+
+    df = quad_df.merge(clinical_df[["Spot Id 1", time_col, event_col]], on="Spot Id 1", how="left")
+    df = df.dropna(subset=[time_col, event_col])
+    if df.empty:
+        print("Stage 8b: no survival data after merge.")
+        return
+
+    quad_order = [
+        "Low infiltration Included",
+        "High infiltration Included",
+        "Low infiltration Excluded",
+        "High infiltration Excluded",
+    ]
+
+    km_dir = outdir / "KM"
+    ensure_dir(km_dir)
+
+    forest_rows = []
+
+    for ph in group_order:
+        sub = df[df["Detailed_Phenotype"] == ph].copy().dropna(subset=["Quadrant"])
+        if sub.empty:
+            continue
+
+        try:
+            lr = multivariate_logrank_test(
+                event_durations=sub[time_col].astype(float),
+                groups=sub["Quadrant"].astype(str),
+                event_observed=sub[event_col].astype(int),
+            )
+            lr_p = float(lr.p_value)
+        except Exception:
+            lr_p = np.nan
+
+        fig, ax = plt.subplots(1, 1, figsize=(7.8, 6.8))
+        kmfs = []
+        for q in quad_order:
+            qsub = sub[sub["Quadrant"] == q]
+            if qsub.empty:
+                continue
+            kmf = KaplanMeierFitter()
+            kmf.fit(
+                durations=qsub[time_col].astype(float),
+                event_observed=qsub[event_col].astype(int),
+                label=f"{q} (n={len(qsub)})",
+            )
+            kmf.plot_survival_function(ax=ax, ci_show=True)
+            kmfs.append(kmf)
+
+        ax.set_title(f"{ph} — KM by quadrant\nlog-rank p={lr_p:.3g}" if np.isfinite(lr_p) else f"{ph} — KM by quadrant")
+        ax.set_xlabel("Days")
+        ax.set_ylabel("Survival probability")
+        ax.grid(True, alpha=0.25)
+
+        try:
+            if len(kmfs) >= 1:
+                add_at_risk_counts(*kmfs, ax=ax)
+                fig.subplots_adjust(bottom=0.28)
+        except Exception:
+            pass
+
+        fig.savefig(km_dir / f"KM_{safe_name(ph)}.png", dpi=300)
+        plt.close(fig)
+
+        present = [q for q in quad_order if q in set(sub["Quadrant"])]
+        if len(present) >= 2:
+            ref = present[0]
+            cox_df = sub[[time_col, event_col, "Quadrant"]].copy()
+            cox_df["Quadrant"] = pd.Categorical(cox_df["Quadrant"], categories=present, ordered=True)
+
+            X = pd.get_dummies(cox_df["Quadrant"], drop_first=True, prefix="Q")
+            cox_in = pd.concat(
+                [cox_df[[time_col, event_col]].reset_index(drop=True), X.reset_index(drop=True)],
+                axis=1,
+            )
+            cox_in = cox_in.dropna()
+
+            if cox_in[event_col].nunique() > 0 and len(cox_in) >= 10:
+                try:
+                    cph = CoxPHFitter()
+                    cph.fit(cox_in, duration_col=time_col, event_col=event_col)
+                    summ = cph.summary.copy()
+                    for cov in summ.index:
+                        forest_rows.append({
+                            "Phenotype": ph,
+                            "Covariate": cov,
+                            "ReferenceQuadrant": ref,
+                            "HR": float(np.exp(summ.loc[cov, "coef"])),
+                            "CI_lower": float(np.exp(summ.loc[cov, "coef lower 95%"])),
+                            "CI_upper": float(np.exp(summ.loc[cov, "coef upper 95%"])),
+                            "p": float(summ.loc[cov, "p"]),
+                            "n": int(len(cox_in)),
+                        })
+                except Exception:
+                    pass
+
+    forest_df = pd.DataFrame(forest_rows)
+    forest_df.to_csv(outdir / "Stage8b_Cox_ForestTable.csv", index=False)
+
+    if not forest_df.empty:
+        forest_df = forest_df.sort_values(["Phenotype", "p"], ascending=[True, True]).reset_index(drop=True)
+
+        fig_h = max(6, 0.28 * len(forest_df) + 1.5)
+        fig, ax = plt.subplots(1, 1, figsize=(9, fig_h))
+
+        y = np.arange(len(forest_df))
+        hr = forest_df["HR"].values
+        lo = forest_df["CI_lower"].values
+        hi = forest_df["CI_upper"].values
+
+        ax.hlines(y=y, xmin=lo, xmax=hi)
+        ax.plot(hr, y, "o")
+        ax.axvline(1.0, ls="--")
+
+        labels = [
+            f"{r.Phenotype} | {r.Covariate} (ref={r.ReferenceQuadrant}) | p={r.p:.2g}"
+            for r in forest_df.itertuples(index=False)
+        ]
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel("Hazard Ratio (HR) with 95% CI")
+        ax.set_title("Stage 8b — Cox HRs for Quadrant (per phenotype)")
+        ax.invert_yaxis()
+        ax.grid(True, axis="x", alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(outdir / "Stage8b_Cox_ForestPlot.png", dpi=300)
+        plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 9: Quadrant heatmaps + stats (KEEP categorical colours)
+# ──────────────────────────────────────────────────────────────────────────────
+def stage9_quadrant_heatmaps(quad_df, clinical_df, outdir):
+    ensure_dir(outdir)
+    quad_palette = {
+        "Low infiltration Included": "#66c2a5",
+        "High infiltration Included": "#fc8d62",
+        "Low infiltration Excluded": "#8da0cb",
+        "High infiltration Excluded": "#e78ac3",
+    }
+    qmap = {k: i for i, k in enumerate(quad_palette)}
+    heat_num = quad_df.pivot(index="Spot Id 1", columns="Detailed_Phenotype", values="Quadrant").replace(qmap)
+
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(
+        heat_num,
+        cmap=ListedColormap(list(quad_palette.values())),
+        norm=BoundaryNorm([-.5, .5, 1.5, 2.5, 3.5], ncolors=4),
+        cbar=False,
+        linewidths=0.5,
+    )
+    plt.xticks(rotation=90)
+    plt.yticks([])
+    plt.title("Distance-based Quadrant Heatmap — All Patients")
+    plt.tight_layout()
+    plt.savefig(Path(outdir) / "QuadrantHeatmap_All.png", dpi=300)
+    plt.close()
+
+def stage9_quadrant_stats(quad_df, clinical_df, outdir):
+    ensure_dir(outdir)
+    quad_palette = [
+        "Low infiltration Included",
+        "High infiltration Included",
+        "Low infiltration Excluded",
+        "High infiltration Excluded",
+    ]
+    qmap = {k: i for i, k in enumerate(quad_palette)}
+    df = quad_df.merge(clinical_df[["Spot Id 1", "SurvivalCategory"]], on="Spot Id 1", how="left")
+    df["QuadCode"] = df["Quadrant"].map(qmap)
+
+    results = []
+    comparisons = [("Short", "Intermediate"), ("Short", "Long"), ("Intermediate", "Long")]
+
+    for ph in df["Detailed_Phenotype"].unique():
+        sub = df[df["Detailed_Phenotype"] == ph].dropna(subset=["SurvivalCategory"])
+        groups = {
+            cat: sub[sub["SurvivalCategory"] == cat]["QuadCode"].dropna().values
+            for cat in ["Short", "Intermediate", "Long"]
+        }
+        if sum(len(v) > 0 for v in groups.values()) < 2:
+            continue
+        try:
+            _, kw_p = kruskal(*[groups[cat] for cat in ["Short", "Intermediate", "Long"] if len(groups[cat]) > 0])
+        except Exception:
+            kw_p = np.nan
+
+        row = {"Phenotype": ph, "KW_p": kw_p}
+        for a, b in comparisons:
+            if len(groups.get(a, [])) > 0 and len(groups.get(b, [])) > 0:
+                try:
+                    mw_p = mannwhitneyu(groups[a], groups[b], alternative="two-sided")[1]
+                except Exception:
+                    mw_p = np.nan
+            else:
+                mw_p = np.nan
+            row[f"{a}_vs_{b}_p"] = mw_p
+        results.append(row)
+
+    res_df = pd.DataFrame(results)
+    if not res_df.empty:
+        res_df["KW_p_FDR"] = smm.multipletests(res_df["KW_p"].fillna(1), method="fdr_bh")[1]
+        for a, b in comparisons:
+            col = f"{a}_vs_{b}_p"
+            res_df[f"{col}_FDR"] = smm.multipletests(res_df[col].fillna(1), method="fdr_bh")[1]
+
+    res_df.to_csv(Path(outdir) / "Quadrant_Stats_BySurvival.csv", index=False)
+    return res_df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN (Stages 1–9)
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    base = Path("/data/home/hfx986/PhD/Analysis1")
+    base.mkdir(parents=True, exist_ok=True)
+
+    final_csv = "/data/home/hfx986/Combat/Final_Cell_Phenotypes.csv"
+    area_csv = "/data/home/hfx986/Area.csv"
+    clin_csv = "/data/home/hfx986/Clinical_Data.csv"
+
+    final_data, area_data, clinical_raw = load_data(final_csv, area_csv, clin_csv)
+    clinical = preprocess_clinical(clinical_raw)
+
+    group_order = sorted(final_data["Detailed_Phenotype"].dropna().unique())
+    palette_dict = dict(zip(group_order, sns.color_palette("tab20", len(group_order))))
+    surv_palette = {"Short": "#4daf4a", "Intermediate": "#377eb8", "Long": "#e41a1c"}
+
+    # Stage 1–2
+    df1 = stage1_median_density(final_data, area_data, base / "Stage1_MedianDensity", group_order, palette_dict)
+    stage1_density_by_survival(df1, clinical, base / "Stage1_MedianDensity" / "BySurvival", group_order, surv_palette)
+
+    df2 = stage2_median_proportion(final_data, base / "Stage2_MedianProportion", group_order, palette_dict)
+    stage2_proportion_by_survival(df2, clinical, base / "Stage2_MedianProportion" / "BySurvival", group_order, surv_palette)
+
+    # Stage 3–5
+    stage3_correlation(df1, df2, group_order, base / "Stage3_Correlation")
+    stage4_mannwhitney_detailed(df2, clinical, base / "Stage4_MW_Detailed")
+    stage5_mannwhitney_per_spot(final_data, clinical, base / "Stage5_MW_PerPatient")
+
+    # Stage 6
+    final_data = stage6_compartment_by_nn_tumour(
+        final_data,
+        outdir=base / "Stage6_CompartmentLabel_NN",
+        mic=0.325002431869506,
+        juxta_um=100.0,
+        tumour_min_neigh=5,
+        tumour_neigh_um=50.0,
+        make_scatter=True,
+        scatter_max_rois=None,
+    )
+
+    # Stage 7 + 7b
+    pt_frac = stage7_within_compartment_composition(
+        final_data,
+        outdir=base / "Stage7_CompartmentComposition",
+        group_order=group_order,
+        summarise="median",
+        make_patient_delta_heatmap=True,
+    )
+
+    if pt_frac is not None and not pt_frac.empty:
+        stage7_juxta_vs_pan_stats(
+            pt_frac,
+            outdir=base / "Stage7_CompartmentComposition",
+            group_order=group_order,
+        )
+
+    stage7b_corr_heatmaps(
+        final_data,
+        group_order,
+        area_data,
+        base / "Stage7_CompartmentComposition" / "7b_CorrHeatmaps",
+    )
+
+    # Stage 8–9
+    quad_df = stage8a_quadrant_scatter(
+        final_data,
+        base / "Stage8_Quadrants" / "Stage8a_QuadrantPlots",
+        group_order,
+    )
+    if quad_df is not None and not quad_df.empty:
+        stage9_quadrant_heatmaps(quad_df, clinical, base / "Stage9_Heatmaps")
+        stage9_quadrant_stats(quad_df, clinical, base / "Stage9_Heatmaps" / "Stats")
+
+        stage8b_km_by_quadrant(
+            quad_df,
+            clinical_df=clinical,
+            outdir=base / "Stage8_Quadrants" / "Stage8b_KM_ByQuadrant",
+            group_order=group_order,
+            time_col="SurvivalDays",
+            event_col="Event",
+        )
+
+    print("DONE: Stages 1–9 complete (Stages 10–15 excluded).")
+
+
+if __name__ == "__main__":
+    main()
