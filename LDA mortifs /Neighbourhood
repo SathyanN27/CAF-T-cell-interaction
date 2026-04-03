@@ -1,0 +1,2135 @@
+import re
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict
+
+from scipy.spatial import cKDTree
+from scipy import sparse
+from scipy.optimize import linear_sum_assignment
+from scipy.stats import kruskal
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+import networkx as nx
+
+from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.model_selection import train_test_split
+
+# Optional survival
+try:
+    from lifelines import KaplanMeierFitter, CoxPHFitter
+    from lifelines.statistics import logrank_test
+    from lifelines.plotting import add_at_risk_counts
+    HAVE_LIFELINES = True
+except Exception:
+    HAVE_LIFELINES = False
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+FINAL_CSV = "/data/home/hfx986/Combat/Final_Cell_Phenotypes.csv"
+CLIN_CSV  = "/data/home/hfx986/Clinical_Data.csv"
+
+PAT_COL    = "Spot Id 1"
+CORE_COL   = "Spot Id 2"
+BLOCK_COL  = "TMA Block Name"
+CELLID_COL = "CellID"
+ROI_COL    = "ROI_KEY"
+
+OS_COL      = "Overall_Survival_(days)"
+FU_COL      = "Follow_up"
+STATUS_COL  = "Alive_or_deceased?"
+
+FINAL_PHEN_COL = "Final_Phenotype"
+DETAIL_COL     = "Detailed_Phenotype"
+MAIN_TYPE_COL  = "Main_Cell_Type"
+
+RANDOM_SEED = 0
+EPS = 1e-9
+
+# ---- µm-native coords ----
+UM_PER_PX = 0.325002431869506
+X_PX_COL = "X_px"
+Y_PX_COL = "Y_px"
+X_COL = "X_um"
+Y_COL = "Y_um"
+
+# ---- Dominant-class labels ----
+ISOLATED_LABEL = "Isolated"
+MIXED_LABEL = "Mixed"
+
+# ---- Hybrid neighbourhood definition ----
+K_NEIGHBORS = 15
+RADIUS_UM = 50.0
+
+# ---- LDA model controls ----
+LDA_LEARNING_METHOD = "batch"
+LDA_MAX_ITER = 50
+LDA_DOC_PRIOR = None
+LDA_TOPIC_PRIOR = None
+
+# ---- K sweep ----
+DO_K_SWEEP = True
+K_SWEEP = list(range(6, 25, 2))
+KSWEEP_TEST_SIZE = 0.25
+KSWEEP_STABILITY_SEEDS = (0, 13)
+KSWEEP_SCORE_WEIGHTS = dict(perplexity=0.40, stability=0.40, separation=0.20)
+FORCE_N_TOPICS: Optional[int] = None  # e.g. 10
+
+# ---- Representative figures ----
+REP_PATIENTS_PER_MOTIF = 6
+REP_PATIENT_GRID_NCOLS = 3
+DOMINANCE_THRESHOLD = None  # e.g. 0.45 to label weak assignments as "Mixed"
+
+# ---- Survival groups for network comparison ----
+# If SURV_GROUP_COL exists in Clinical_Data.csv it will be used.
+# Otherwise groups are derived from OS_days tertiles.
+SURV_GROUP_COL = None
+SURV_GROUP_NAME = "Survival_Group"
+SURV_GROUP_ORDER = ["Short", "Intermediate", "Long"]
+
+# ---- True neighbourhood-patch interaction network ----
+PATCH_RADIUS_UM = 25.0
+PATCH_MIN_CELLS = 3
+PATCH_INTERACT_RADIUS_UM = 50.0
+
+NETWORK_TOP_EDGES = 25
+NETWORK_LAYOUT_SEED = 7
+NETWORK_NODE_SIZE_BASE = 700
+NETWORK_NODE_SIZE_SCALE = 10000
+NETWORK_EDGE_WIDTH_SCALE = 16
+NETWORK_MIN_GROUP_N = 5
+
+# ---- Triangle heatmaps for neighbourhood networks ----
+NETWORK_HEATMAP_STAT = "median"   # "median" or "mean" across patients within group
+NETWORK_HEATMAP_CMAP = "mako"
+NETWORK_DIFF_CMAP = "coolwarm"
+
+# ---- Outputs ----
+BASE_OUT = Path(
+    f"/data/home/hfx986/PhD/Analysis/"
+    f"LDA_Hybrid_TumourMain_OtherFinalPhenotype_k{K_NEIGHBORS}_R{int(RADIUS_UM)}um"
+)
+BASE_OUT.mkdir(parents=True, exist_ok=True)
+
+DIRS = {
+    "00_inputs": BASE_OUT / "00_inputs_snapshot",
+    "01_docs": BASE_OUT / "01_neighbourhood_docs",
+    "02_k_sweep": BASE_OUT / "02_k_sweep",
+    "03_lda": BASE_OUT / "03_lda_model",
+    "04_core_level": BASE_OUT / "04_core_level",
+    "05_patient_level": BASE_OUT / "05_patient_level",
+    "06_survival": BASE_OUT / "06_survival",
+    "07_figures": BASE_OUT / "07_figures",
+}
+for p in DIRS.values():
+    p.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# UTILS
+# =========================================================
+
+def safe_name(x) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(x)).strip("_")
+
+def to_num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def zscore(s: pd.Series) -> pd.Series:
+    s = s.astype(float)
+    return (s - s.mean()) / (s.std(ddof=0) + EPS)
+
+def bh_fdr(pvals: pd.Series) -> pd.Series:
+    p = pvals.astype(float).values
+    n = len(p)
+    if n == 0:
+        return pd.Series(dtype=float)
+
+    order = np.argsort(p)
+    ranks = np.empty(n, dtype=int)
+    ranks[order] = np.arange(1, n + 1)
+    q = p * n / np.maximum(ranks, 1)
+
+    q_sorted = q[order]
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+
+    out = np.empty(n, dtype=float)
+    out[order] = np.clip(q_sorted, 0, 1)
+    return pd.Series(out, index=pvals.index)
+
+def motif_sort_key(x):
+    m = re.search(r"Motif(\d+)$", str(x))
+    return int(m.group(1)) if m else 10**9
+
+def snapshot_inputs():
+    try:
+        cols = pd.read_csv(FINAL_CSV, nrows=1).columns.tolist()
+        pd.Series(cols).to_csv(
+            DIRS["00_inputs"] / "Final_Cell_Phenotypes_columns.txt",
+            index=False, header=False
+        )
+    except Exception:
+        pass
+    try:
+        cols = pd.read_csv(CLIN_CSV, nrows=1).columns.tolist()
+        pd.Series(cols).to_csv(
+            DIRS["00_inputs"] / "Clinical_Data_columns.txt",
+            index=False, header=False
+        )
+    except Exception:
+        pass
+
+LABEL_ALIASES = {
+    "tripple negative": "Triple negative",
+    "triple negative": "Triple negative",
+    "b cell": "B Cell",
+    "b cells": "B Cell",
+    "other immune ": "other immune",
+    "otherimmune": "other immune",
+}
+
+def clean_label_series(s: pd.Series) -> pd.Series:
+    x = s.astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
+    low = x.str.lower()
+    mapped = low.map(LABEL_ALIASES)
+    out = mapped.fillna(x)
+    out = out.replace({"nan": np.nan, "": np.nan, "None": np.nan})
+    return out
+
+def audit_core_identifier(cells: pd.DataFrame):
+    tmp = cells[[CORE_COL, PAT_COL, BLOCK_COL]].drop_duplicates().copy()
+    audit = (
+        tmp.groupby(CORE_COL, as_index=False)
+           .agg(n_patients=(PAT_COL, "nunique"),
+                n_blocks=(BLOCK_COL, "nunique"))
+    )
+    audit["appears_nonunique"] = (audit["n_patients"] > 1) | (audit["n_blocks"] > 1)
+    audit.to_csv(DIRS["00_inputs"] / "QC_core_identifier_audit.csv", index=False)
+
+    n_bad = int(audit["appears_nonunique"].sum())
+    if n_bad == 0:
+        print(f"[QC] {CORE_COL} appears globally unique in loaded cells.")
+    else:
+        print(f"[QC] WARNING: {CORE_COL} overlaps across patients/blocks for {n_bad} core IDs.")
+        print(f"[QC] See: {DIRS['00_inputs'] / 'QC_core_identifier_audit.csv'}")
+
+def make_palette(classes: List[str]) -> dict:
+    base = sns.color_palette("tab20", n_colors=max(len(classes), 3))
+    pal = {c: base[i] for i, c in enumerate(classes)}
+    pal[ISOLATED_LABEL] = (0.82, 0.82, 0.82)
+    pal[MIXED_LABEL] = (0.55, 0.55, 0.55)
+    return pal
+
+
+# =========================================================
+# LOADERS
+# =========================================================
+
+def load_cells() -> pd.DataFrame:
+    header = pd.read_csv(FINAL_CSV, nrows=0).columns.tolist()
+
+    required = [BLOCK_COL, PAT_COL, CORE_COL, "X", "Y", MAIN_TYPE_COL, DETAIL_COL, FINAL_PHEN_COL]
+    missing = [c for c in required if c not in header]
+    if missing:
+        raise ValueError(f"FINAL_CSV is missing required columns: {missing}")
+
+    usecols = [c for c in [CELLID_COL] + required if c in header]
+    df = pd.read_csv(FINAL_CSV, usecols=usecols, low_memory=False)
+
+    if CELLID_COL not in df.columns:
+        df[CELLID_COL] = np.arange(len(df)).astype(str)
+
+    df[X_PX_COL] = to_num(df["X"])
+    df[Y_PX_COL] = to_num(df["Y"])
+    df = df.dropna(subset=[X_PX_COL, Y_PX_COL]).copy()
+
+    df[X_COL] = df[X_PX_COL].astype(float) * UM_PER_PX
+    df[Y_COL] = df[Y_PX_COL].astype(float) * UM_PER_PX
+
+    for c in [CELLID_COL, BLOCK_COL, PAT_COL, CORE_COL, MAIN_TYPE_COL]:
+        df[c] = df[c].astype(str).str.strip()
+
+    df[DETAIL_COL] = clean_label_series(df[DETAIL_COL])
+    df[FINAL_PHEN_COL] = clean_label_series(df[FINAL_PHEN_COL])
+
+    df["main_type_lc"] = df[MAIN_TYPE_COL].astype(str).str.strip().str.lower()
+    df["is_tumour"] = df["main_type_lc"].eq("tumour")
+    df["is_caf"] = df["main_type_lc"].eq("caf")
+    df["is_immune"] = df["main_type_lc"].eq("immune")
+
+    # Hybrid label logic:
+    #   tumour -> Main_Cell_Type
+    #   all other cells -> Final_Phenotype
+    #   fallback -> Detailed_Phenotype -> Main_Cell_Type
+    df["LDA_Label"] = np.where(
+        df["is_tumour"].values,
+        df[MAIN_TYPE_COL].values,
+        df[FINAL_PHEN_COL].values
+    )
+    df["LDA_Label"] = pd.Series(df["LDA_Label"], index=df.index)
+    df["LDA_Label"] = df["LDA_Label"].where(df["LDA_Label"].notna(), df[DETAIL_COL])
+    df["LDA_Label"] = df["LDA_Label"].where(df["LDA_Label"].notna(), df[MAIN_TYPE_COL])
+
+    df = df[df["LDA_Label"].notna()].copy()
+    df["LDA_Label"] = df["LDA_Label"].astype(str).str.strip()
+    df = df[df["LDA_Label"].str.len() > 0].copy()
+    df = df[df["LDA_Label"].str.lower() != "nan"].copy()
+
+    # Robust ROI key
+    df[ROI_COL] = (
+        df[PAT_COL].astype(str).str.strip() + "||" +
+        df[BLOCK_COL].astype(str).str.strip() + "||" +
+        df[CORE_COL].astype(str).str.strip()
+    )
+
+    return df
+
+def load_and_parse_survival(clin_csv: str) -> pd.DataFrame:
+    clin = pd.read_csv(clin_csv, low_memory=False)
+    clin.columns = [str(c).strip() for c in clin.columns]
+
+    for req in [PAT_COL, OS_COL, FU_COL, STATUS_COL]:
+        if req not in clin.columns:
+            raise ValueError(f"Clinical file missing required column: {req}. Columns: {clin.columns.tolist()}")
+
+    clin[PAT_COL] = clin[PAT_COL].astype(str).str.strip()
+
+    status = clin[STATUS_COL].astype(str).str.strip().str.lower()
+    is_deceased = status.isin(["deceased", "dead", "died"]) | status.str.contains("deceased", na=False)
+    is_alive = status.str.contains("alive", na=False)
+    is_ltfu = status.str.contains("lost", na=False)
+
+    os_days = pd.to_numeric(clin[OS_COL], errors="coerce")
+    fu_days = pd.to_numeric(clin[FU_COL], errors="coerce")
+
+    event = np.where(is_deceased, 1, np.where(is_alive | is_ltfu, 0, np.nan)).astype(float)
+
+    # Safer time handling:
+    # - deceased patients should use OS_days
+    # - alive/LTFU patients preferentially use Follow_up, with OS_days as backup
+    time_days = pd.Series(np.nan, index=clin.index, dtype=float)
+    time_days.loc[is_deceased] = os_days.loc[is_deceased]
+    time_days.loc[is_alive | is_ltfu] = fu_days.loc[is_alive | is_ltfu]
+    alive_missing_fu = (is_alive | is_ltfu) & time_days.isna()
+    time_days.loc[alive_missing_fu] = os_days.loc[alive_missing_fu]
+
+    surv = pd.DataFrame({
+        PAT_COL: clin[PAT_COL],
+        "OS_days": time_days,
+        "OS_event": event
+    })
+
+    if SURV_GROUP_COL is not None and SURV_GROUP_COL in clin.columns:
+        surv[SURV_GROUP_NAME] = clin[SURV_GROUP_COL].astype(str).str.strip()
+
+    surv = surv.dropna(subset=["OS_days", "OS_event"]).copy()
+    surv["OS_event"] = surv["OS_event"].astype(int)
+    surv["OS_days"] = surv["OS_days"].astype(float)
+    surv = surv[surv["OS_days"] > 0].copy()
+
+    if surv[PAT_COL].duplicated().any():
+        surv = (
+            surv.sort_values([PAT_COL, "OS_event", "OS_days"], ascending=[True, False, False])
+                .drop_duplicates(subset=[PAT_COL], keep="first")
+                .reset_index(drop=True)
+        )
+
+    n_ok = surv[PAT_COL].nunique()
+    n_event = int(surv["OS_event"].sum())
+    n_cens = int((surv["OS_event"] == 0).sum())
+    print(f"[survival] usable patients={n_ok:,} events={n_event:,} censored={n_cens:,}")
+
+    surv.to_csv(DIRS["00_inputs"] / "SURVIVAL_cleaned_patient_table.csv", index=False)
+    return surv
+
+def ensure_survival_groups(surv: pd.DataFrame) -> pd.DataFrame:
+    out = surv.copy()
+
+    if SURV_GROUP_NAME in out.columns:
+        out[SURV_GROUP_NAME] = out[SURV_GROUP_NAME].astype(str).str.strip()
+        out.loc[out[SURV_GROUP_NAME].isin(["", "nan", "None"]), SURV_GROUP_NAME] = np.nan
+
+    if SURV_GROUP_NAME not in out.columns or out[SURV_GROUP_NAME].isna().all():
+        q1, q2 = out["OS_days"].quantile([1/3, 2/3]).values
+        if q1 >= q2:
+            med = out["OS_days"].median()
+            out[SURV_GROUP_NAME] = np.where(out["OS_days"] <= med, "Short", "Long")
+        else:
+            out[SURV_GROUP_NAME] = pd.cut(
+                out["OS_days"],
+                bins=[-np.inf, q1, q2, np.inf],
+                labels=SURV_GROUP_ORDER,
+                include_lowest=True
+            ).astype(str)
+
+    return out
+
+
+# =========================================================
+# DOCUMENT CONSTRUCTION
+# =========================================================
+
+def build_vocab(cells: pd.DataFrame) -> List[str]:
+    vocab = sorted(cells["LDA_Label"].astype(str).unique().tolist())
+    (DIRS["01_docs"] / "vocab_LDA_Label.txt").write_text("\n".join(vocab) + "\n")
+    return vocab
+
+def hybrid_neigh_indices(coords_um: np.ndarray, k: int, r_um: float) -> List[np.ndarray]:
+    n = coords_um.shape[0]
+    if n == 0:
+        return []
+
+    tree = cKDTree(coords_um)
+    nbr_lists = tree.query_ball_point(coords_um, r=float(r_um))
+
+    out = []
+    for i, nbrs in enumerate(nbr_lists):
+        nbrs2 = [j for j in nbrs if j != i]
+        if not nbrs2:
+            out.append(np.array([], dtype=int))
+            continue
+
+        nbrs2 = np.array(nbrs2, dtype=int)
+        if nbrs2.size <= k:
+            out.append(nbrs2)
+            continue
+
+        d = np.sqrt(((coords_um[nbrs2] - coords_um[i]) ** 2).sum(axis=1))
+        sel = np.argsort(d)[:k]
+        out.append(nbrs2[sel])
+
+    return out
+
+def build_docs_sparse(cells: pd.DataFrame, vocab: List[str]) -> Tuple[sparse.csr_matrix, pd.DataFrame]:
+    vocab_index = {v: i for i, v in enumerate(vocab)}
+
+    roi_ids = list(cells[ROI_COL].astype(str).unique())
+    print(f"[docs] hybrid kNN-within-radius: k={K_NEIGHBORS}, R={RADIUS_UM} µm | ROIs={len(roi_ids):,} | vocab={len(vocab):,}")
+
+    data = []
+    rows = []
+    cols = []
+    meta_rows = []
+    neigh_count_list = []
+    row_offset = 0
+
+    for i, rid in enumerate(roi_ids, start=1):
+        core = (
+            cells[cells[ROI_COL].astype(str) == str(rid)]
+            .copy()
+            .dropna(subset=[X_COL, Y_COL])
+            .reset_index(drop=True)
+        )
+        if core.empty:
+            continue
+
+        coords = core[[X_COL, Y_COL]].to_numpy(float)
+        labs = core["LDA_Label"].astype(str).to_numpy()
+
+        neigh_idx = hybrid_neigh_indices(coords, k=K_NEIGHBORS, r_um=RADIUS_UM)
+
+        for r_local, nbrs in enumerate(neigh_idx):
+            n_nbr = int(nbrs.size)
+            neigh_count_list.append(n_nbr)
+
+            if n_nbr > 0:
+                neigh_labs = labs[nbrs]
+                idxs = [vocab_index.get(l, None) for l in neigh_labs]
+                idxs = [j for j in idxs if j is not None]
+
+                if idxs:
+                    bc = np.bincount(np.array(idxs, dtype=int), minlength=len(vocab_index))
+                    nz = np.where(bc > 0)[0]
+                    for j in nz:
+                        rows.append(row_offset + r_local)
+                        cols.append(int(j))
+                        data.append(int(bc[j]))
+
+            meta_rows.append({
+                CELLID_COL: str(core[CELLID_COL].iloc[r_local]),
+                BLOCK_COL: str(core[BLOCK_COL].iloc[r_local]),
+                PAT_COL: str(core[PAT_COL].iloc[r_local]),
+                CORE_COL: str(core[CORE_COL].iloc[r_local]),
+                ROI_COL: str(core[ROI_COL].iloc[r_local]),
+                MAIN_TYPE_COL: str(core[MAIN_TYPE_COL].iloc[r_local]),
+                DETAIL_COL: str(core[DETAIL_COL].iloc[r_local]),
+                FINAL_PHEN_COL: str(core[FINAL_PHEN_COL].iloc[r_local]),
+                "LDA_Label": str(core["LDA_Label"].iloc[r_local]),
+                "main_type_lc": str(core["main_type_lc"].iloc[r_local]),
+                "is_tumour": bool(core["is_tumour"].iloc[r_local]),
+                "is_caf": bool(core["is_caf"].iloc[r_local]),
+                "is_immune": bool(core["is_immune"].iloc[r_local]),
+                X_COL: float(coords[r_local, 0]),
+                Y_COL: float(coords[r_local, 1]),
+                "neigh_count": n_nbr,
+                "is_isolated": bool(n_nbr == 0),
+            })
+
+        row_offset += len(core)
+
+        if i % 100 == 0 or i == len(roi_ids):
+            print(f"  processed ROIs {i}/{len(roi_ids)} | rows so far={len(meta_rows):,}")
+
+    X_all = sparse.csr_matrix(
+        (data, (rows, cols)),
+        shape=(len(meta_rows), len(vocab_index)),
+        dtype=np.int32
+    )
+    cell_meta = pd.DataFrame(meta_rows)
+
+    cell_meta.to_csv(
+        DIRS["01_docs"] / "cell_meta_index_all_cells.csv.gz",
+        index=False,
+        compression="gzip"
+    )
+    sparse.save_npz(DIRS["01_docs"] / "X_docs_sparse_counts_all_cells.npz", X_all)
+
+    qc = pd.DataFrame({"neigh_count": np.array(neigh_count_list, dtype=int)})
+    qc.to_csv(DIRS["01_docs"] / "QC_neighbour_counts_per_cell.csv", index=False)
+
+    plt.figure(figsize=(7, 4))
+    sns.histplot(qc["neigh_count"].values, bins=30)
+    plt.title("Neighbour count per cell (hybrid kNN-within-radius)")
+    plt.xlabel("Number of neighbours used")
+    plt.tight_layout()
+    plt.savefig(DIRS["07_figures"] / "QC_neighbour_counts_hist.png", dpi=300)
+    plt.close()
+
+    iso_n = int(cell_meta["is_isolated"].sum())
+    iso_pct = 100.0 * iso_n / max(len(cell_meta), 1)
+    pd.DataFrame({
+        "n_total_cells": [len(cell_meta)],
+        "n_isolated_cells": [iso_n],
+        "pct_isolated_cells": [iso_pct]
+    }).to_csv(DIRS["01_docs"] / "QC_isolated_cell_summary.csv", index=False)
+
+    print(f"[docs] total cells={len(cell_meta):,} | isolated={iso_n:,} ({iso_pct:.2f}%)")
+    return X_all, cell_meta
+
+def prepare_fit_subset(X_all: sparse.csr_matrix, cell_meta: pd.DataFrame) -> Tuple[sparse.csr_matrix, pd.DataFrame, np.ndarray]:
+    fit_mask = cell_meta["neigh_count"].astype(int).values > 0
+    X_fit = X_all[fit_mask]
+    cell_meta_fit = cell_meta.loc[fit_mask].reset_index(drop=True).copy()
+
+    pd.DataFrame({
+        "n_total_cells": [len(cell_meta)],
+        "n_fit_cells": [int(fit_mask.sum())],
+        "n_isolated_cells": [int((~fit_mask).sum())],
+        "pct_fit_cells": [100.0 * fit_mask.sum() / max(len(cell_meta), 1)],
+        "pct_isolated_cells": [100.0 * (~fit_mask).sum() / max(len(cell_meta), 1)],
+    }).to_csv(DIRS["01_docs"] / "QC_fit_subset_summary.csv", index=False)
+
+    if X_fit.shape[0] == 0:
+        raise ValueError("No informative cells (neigh_count > 0) available for LDA fitting.")
+
+    print(f"[fit-subset] informative cells={X_fit.shape[0]:,} | isolated cells={(~fit_mask).sum():,}")
+    return X_fit, cell_meta_fit, fit_mask
+
+
+# =========================================================
+# K SELECTION
+# =========================================================
+
+def topic_beta(lda: LatentDirichletAllocation) -> np.ndarray:
+    beta = lda.components_.astype(float)
+    beta = beta / (beta.sum(axis=1, keepdims=True) + EPS)
+    return beta
+
+def cosine_sim_matrix(A: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(A, axis=1, keepdims=True) + EPS
+    An = A / n
+    return An @ An.T
+
+def topic_redundancy(beta: np.ndarray) -> float:
+    S = cosine_sim_matrix(beta)
+    k = S.shape[0]
+    mask = ~np.eye(k, dtype=bool)
+    return float(np.mean(S[mask])) if k > 1 else 0.0
+
+def stability_hungarian(beta_a: np.ndarray, beta_b: np.ndarray) -> float:
+    Sa = beta_a / (np.linalg.norm(beta_a, axis=1, keepdims=True) + EPS)
+    Sb = beta_b / (np.linalg.norm(beta_b, axis=1, keepdims=True) + EPS)
+    sim = Sa @ Sb.T
+    cost = 1.0 - sim
+    r, c = linear_sum_assignment(cost)
+    return float(np.mean(sim[r, c]))
+
+def minmax_scale(x: np.ndarray, invert: bool = False) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if np.all(~np.isfinite(x)) or np.nanmax(x) - np.nanmin(x) < 1e-12:
+        out = np.zeros_like(x)
+    else:
+        out = (x - np.nanmin(x)) / (np.nanmax(x) - np.nanmin(x) + EPS)
+    return 1.0 - out if invert else out
+
+def fit_lda(X_train: sparse.csr_matrix, n_topics: int, seed: int) -> LatentDirichletAllocation:
+    lda = LatentDirichletAllocation(
+        n_components=n_topics,
+        learning_method=LDA_LEARNING_METHOD,
+        max_iter=LDA_MAX_ITER,
+        random_state=seed,
+        doc_topic_prior=LDA_DOC_PRIOR,
+        topic_word_prior=LDA_TOPIC_PRIOR,
+        evaluate_every=0,
+        verbose=0,
+    )
+    lda.fit(X_train)
+    return lda
+
+def select_k_via_sweep(X: sparse.csr_matrix, cell_meta: pd.DataFrame) -> int:
+    roi_ids = cell_meta[ROI_COL].astype(str).unique().tolist()
+
+    if len(roi_ids) < 4:
+        fallback_k = min(10, max(2, min(X.shape[0] - 1, X.shape[1])))
+        fallback_k = int(max(2, fallback_k))
+        (DIRS["02_k_sweep"] / "K_SWEEP_SKIPPED.txt").write_text(
+            f"Too few informative ROIs for K-sweep ({len(roi_ids)} ROIs). Using fallback K={fallback_k}.\n"
+        )
+        print(f"[K-sweep] skipped (too few informative ROIs); using K={fallback_k}")
+        return fallback_k
+
+    tr_rois, te_rois = train_test_split(roi_ids, test_size=KSWEEP_TEST_SIZE, random_state=RANDOM_SEED)
+
+    tr_mask = cell_meta[ROI_COL].astype(str).isin(tr_rois).values
+    te_mask = ~tr_mask
+
+    X_train = X[tr_mask]
+    X_test  = X[te_mask]
+
+    max_valid_k = max(2, min(X_train.shape[0] - 1, X_train.shape[1]))
+    k_list = [k for k in K_SWEEP if 2 <= k <= max_valid_k]
+    if not k_list:
+        k_list = [max_valid_k]
+
+    report_rows = []
+    print(f"[K-sweep] train ROIs={len(tr_rois):,} test ROIs={len(te_rois):,} | train docs={X_train.shape[0]:,} test docs={X_test.shape[0]:,}")
+    print(f"[K-sweep] evaluating K values: {k_list}")
+
+    for K in k_list:
+        print(f"  [K-sweep] K={K} ...")
+        lda_a = fit_lda(X_train, n_topics=K, seed=KSWEEP_STABILITY_SEEDS[0])
+        lda_b = fit_lda(X_train, n_topics=K, seed=KSWEEP_STABILITY_SEEDS[1])
+
+        perp = float(lda_a.perplexity(X_test)) if X_test.shape[0] > 0 else np.nan
+        beta_a = topic_beta(lda_a)
+        beta_b = topic_beta(lda_b)
+
+        stab = stability_hungarian(beta_a, beta_b)
+        red  = topic_redundancy(beta_a)
+        sep  = 1.0 - red
+
+        report_rows.append({
+            "K": K,
+            "heldout_perplexity": perp,
+            "stability_mean_cosine": stab,
+            "redundancy_mean_cosine": red,
+            "separation_1_minus_redundancy": sep,
+        })
+
+    rep = pd.DataFrame(report_rows)
+    rep.to_csv(DIRS["02_k_sweep"] / "K_sweep_report.csv", index=False)
+
+    s_perp = minmax_scale(rep["heldout_perplexity"].values, invert=True)
+    s_stab = minmax_scale(rep["stability_mean_cosine"].values, invert=False)
+    s_sep  = minmax_scale(rep["separation_1_minus_redundancy"].values, invert=False)
+
+    w = KSWEEP_SCORE_WEIGHTS
+    rep["score"] = w["perplexity"] * s_perp + w["stability"] * s_stab + w["separation"] * s_sep
+    rep["score_perplexity_scaled"] = s_perp
+    rep["score_stability_scaled"] = s_stab
+    rep["score_separation_scaled"] = s_sep
+    rep.to_csv(DIRS["02_k_sweep"] / "K_sweep_report_with_scores.csv", index=False)
+
+    for ycol, title, fname in [
+        ("heldout_perplexity", "Held-out perplexity vs K (lower is better)", "K_sweep_perplexity.png"),
+        ("stability_mean_cosine", "Stability vs K (higher is better)", "K_sweep_stability.png"),
+        ("separation_1_minus_redundancy", "Separation vs K (higher is better)", "K_sweep_separation.png"),
+        ("score", "Overall K-sweep score (higher is better)", "K_sweep_overall_score.png"),
+    ]:
+        plt.figure(figsize=(8, 4.5))
+        plt.plot(rep["K"], rep[ycol], marker="o")
+        plt.title(title)
+        plt.xlabel("K topics")
+        plt.ylabel(ycol)
+        plt.tight_layout()
+        plt.savefig(DIRS["02_k_sweep"] / fname, dpi=300)
+        plt.close()
+
+    best = rep.sort_values(
+        ["score", "stability_mean_cosine", "separation_1_minus_redundancy"],
+        ascending=[False, False, False]
+    ).iloc[0]
+    bestK = int(best["K"])
+
+    (DIRS["02_k_sweep"] / "K_SELECTED.txt").write_text(
+        f"Selected K = {bestK}\n\n{best.to_string()}\n"
+    )
+    print(f"[K-sweep] selected K={bestK}")
+    return bestK
+
+
+# =========================================================
+# FINAL LDA
+# =========================================================
+
+def fit_final_lda(X_fit: sparse.csr_matrix, vocab: List[str], n_topics: int) -> Tuple[LatentDirichletAllocation, np.ndarray, pd.DataFrame]:
+    print(f"[LDA] final fit on informative docs only: n_docs={X_fit.shape[0]:,}, n_vocab={X_fit.shape[1]:,}, K={n_topics}")
+
+    lda = LatentDirichletAllocation(
+        n_components=n_topics,
+        learning_method=LDA_LEARNING_METHOD,
+        max_iter=LDA_MAX_ITER,
+        random_state=RANDOM_SEED,
+        doc_topic_prior=LDA_DOC_PRIOR,
+        topic_word_prior=LDA_TOPIC_PRIOR,
+        evaluate_every=0,
+        verbose=0,
+    )
+    theta_fit = lda.fit_transform(X_fit)
+
+    motifs = [f"Motif{t+1}" for t in range(n_topics)]
+    beta = topic_beta(lda)
+    beta_df = pd.DataFrame(beta, columns=vocab, index=motifs)
+
+    beta_df.to_csv(DIRS["03_lda"] / "LDA_beta_topic_compositions.csv")
+    np.save(DIRS["03_lda"] / "LDA_theta_informative_cells.npy", theta_fit)
+    sparse.save_npz(DIRS["03_lda"] / "X_docs_sparse_counts_informative_cells.npz", X_fit)
+
+    plt.figure(figsize=(max(10, 0.25 * len(vocab)), max(5, 0.35 * n_topics + 2)))
+    sns.heatmap(beta_df, cmap="mako", linewidths=0.2, linecolor="lightgrey")
+    plt.title("Spatial-LDA motif compositions (beta): label probability per motif")
+    plt.tight_layout()
+    plt.savefig(DIRS["07_figures"] / "LDA_beta_heatmap.png", dpi=300)
+    plt.close()
+
+    lines = []
+    topn = 12
+    for m in motifs:
+        row = beta_df.loc[m].sort_values(ascending=False)
+        tops = row.head(topn)
+        lines.append(f"{m}: " + ", ".join([f"{k}({v:.3f})" for k, v in tops.items()]))
+
+        plt.figure(figsize=(7, 3.8))
+        tops.sort_values(ascending=True).plot(kind="barh")
+        plt.title(f"{m} — top labels (beta)")
+        plt.xlabel("Probability")
+        plt.tight_layout()
+        plt.savefig(DIRS["07_figures"] / f"{m}_top_labels.png", dpi=300)
+        plt.close()
+
+    (DIRS["03_lda"] / "LDA_topic_top_labels.txt").write_text("\n".join(lines) + "\n")
+    return lda, theta_fit, beta_df
+
+def expand_theta_to_all_cells(theta_fit: np.ndarray, fit_mask: np.ndarray) -> np.ndarray:
+    n_all = len(fit_mask)
+    k = theta_fit.shape[1]
+    theta_all = np.full((n_all, k), np.nan, dtype=float)
+    theta_all[fit_mask] = theta_fit
+    np.save(DIRS["03_lda"] / "LDA_theta_all_cells_nan_for_isolated.npy", theta_all)
+    return theta_all
+
+def assign_dominant_neighbourhood(theta_all: np.ndarray,
+                                  is_isolated: np.ndarray,
+                                  dominance_threshold: Optional[float] = None) -> pd.DataFrame:
+    motifs = [f"Motif{t+1}" for t in range(theta_all.shape[1])]
+    out = pd.DataFrame(index=np.arange(len(is_isolated)))
+    out["Dominant_Neighbourhood"] = ISOLATED_LABEL
+    out["Dominant_Theta"] = np.nan
+
+    inf_mask = ~is_isolated.astype(bool)
+    if np.any(inf_mask):
+        T = theta_all[inf_mask]
+        idx = np.argmax(T, axis=1)
+        mx = np.max(T, axis=1)
+        labs = np.array(motifs, dtype=object)[idx]
+
+        if dominance_threshold is not None:
+            labs = np.where(mx >= dominance_threshold, labs, MIXED_LABEL)
+
+        out.loc[inf_mask, "Dominant_Neighbourhood"] = labs
+        out.loc[inf_mask, "Dominant_Theta"] = mx
+
+    return out
+
+def save_cell_assignments(theta_all: np.ndarray, cell_meta: pd.DataFrame) -> pd.DataFrame:
+    motifs = [f"Motif{t+1}" for t in range(theta_all.shape[1])]
+    df = cell_meta.copy()
+
+    for t, m in enumerate(motifs):
+        df[m] = theta_all[:, t]
+
+    dom = assign_dominant_neighbourhood(
+        theta_all=theta_all,
+        is_isolated=df["is_isolated"].astype(bool).values,
+        dominance_threshold=DOMINANCE_THRESHOLD
+    )
+    df["Dominant_Class"] = dom["Dominant_Neighbourhood"].values
+    df["Dominant_Class_Weight"] = dom["Dominant_Theta"].values
+
+    df.to_csv(DIRS["03_lda"] / "cell_assignments_all_cells.csv.gz", index=False, compression="gzip")
+
+    counts = df["Dominant_Class"].value_counts(dropna=False).rename_axis("class").reset_index(name="n_cells")
+    counts.to_csv(DIRS["03_lda"] / "cell_assignment_counts.csv", index=False)
+    return df
+
+
+# =========================================================
+# CORE / PATIENT SUMMARIES
+# =========================================================
+
+def aggregate_core_level(theta_all: np.ndarray, cell_meta: pd.DataFrame) -> pd.DataFrame:
+    motifs = [f"Motif{t+1}" for t in range(theta_all.shape[1])]
+    df = cell_meta.copy()
+
+    for t, m in enumerate(motifs):
+        df[m] = theta_all[:, t]
+
+    dom = assign_dominant_neighbourhood(
+        theta_all=theta_all,
+        is_isolated=df["is_isolated"].astype(bool).values,
+        dominance_threshold=DOMINANCE_THRESHOLD
+    )
+    df["Dominant_Class"] = dom["Dominant_Neighbourhood"].values
+
+    df[PAT_COL] = df[PAT_COL].astype(str).str.strip()
+    df[CORE_COL] = df[CORE_COL].astype(str).str.strip()
+    df[ROI_COL] = df[ROI_COL].astype(str).str.strip()
+    df["main_type_lc"] = df["main_type_lc"].astype(str).str.strip().str.lower()
+    df["is_informative"] = ~df["is_isolated"].astype(bool)
+
+    classes = motifs + [ISOLATED_LABEL]
+    if DOMINANCE_THRESHOLD is not None:
+        classes = motifs + [MIXED_LABEL, ISOLATED_LABEL]
+
+    core_rows = []
+
+    for (pid, rid), sub in df.groupby([PAT_COL, ROI_COL], sort=False):
+        inf = sub[sub["is_informative"]].copy()
+
+        row = {
+            PAT_COL: pid,
+            ROI_COL: rid,
+            CORE_COL: str(sub[CORE_COL].iloc[0]),
+            BLOCK_COL: str(sub[BLOCK_COL].iloc[0]),
+            "n_cells_core": int(len(sub)),
+            "n_informative_core": int(len(inf)),
+            "n_isolated_core": int(sub["is_isolated"].sum()),
+            "frac_isolated_core": float(sub["is_isolated"].mean()) if len(sub) else np.nan,
+            "median_neigh_count_core": float(np.median(sub["neigh_count"].astype(float))) if len(sub) else np.nan,
+            "median_neigh_count_informative_core": float(np.median(inf["neigh_count"].astype(float))) if len(inf) else np.nan,
+        }
+
+        for m in motifs:
+            row[f"GLOBAL__{m}"] = float(inf[m].mean()) if len(inf) else np.nan
+
+        for comp_name, comp_mask in [
+            ("TUMOUR", sub["main_type_lc"].eq("tumour")),
+            ("CAF", sub["main_type_lc"].eq("caf")),
+            ("IMMUNE", sub["main_type_lc"].eq("immune")),
+        ]:
+            comp = sub[comp_mask].copy()
+            comp_inf = comp[comp["is_informative"]].copy()
+
+            row[f"{comp_name}__n_cells"] = int(len(comp))
+            row[f"{comp_name}__n_informative"] = int(len(comp_inf))
+            row[f"{comp_name}__n_isolated"] = int(comp["is_isolated"].sum())
+            row[f"{comp_name}__frac_isolated"] = float(comp["is_isolated"].mean()) if len(comp) else np.nan
+
+            for m in motifs:
+                row[f"{comp_name}__{m}"] = float(comp_inf[m].mean()) if len(comp_inf) else np.nan
+
+        for cls in classes:
+            row[f"DOMPROP__{cls}"] = float((sub["Dominant_Class"] == cls).mean()) if len(sub) else np.nan
+
+        if len(inf):
+            for m in motifs:
+                row[f"DOMPROP_INF__{m}"] = float((inf["Dominant_Class"] == m).mean())
+        else:
+            for m in motifs:
+                row[f"DOMPROP_INF__{m}"] = np.nan
+
+        core_rows.append(row)
+
+    core_feat = pd.DataFrame(core_rows)
+    core_feat.to_csv(DIRS["04_core_level"] / "core_level_LDA_motif_burdens.csv", index=False)
+
+    idx = (
+        core_feat.groupby(PAT_COL)
+        .agg(
+            n_cores=(ROI_COL, "nunique"),
+            n_cells=("n_cells_core", "sum"),
+            n_informative=("n_informative_core", "sum"),
+            n_isolated=("n_isolated_core", "sum"),
+        )
+        .reset_index()
+    )
+    idx.to_csv(DIRS["04_core_level"] / "patient_core_counts_and_cells.csv", index=False)
+
+    return core_feat
+
+def patient_core_median(core_feat: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = core_feat.select_dtypes(include=[np.number]).columns.tolist()
+
+    pat_med = (
+        core_feat.groupby(PAT_COL, as_index=False)[numeric_cols]
+        .median()
+    )
+
+    totals = (
+        core_feat.groupby(PAT_COL, as_index=False)
+        .agg(
+            n_cores=(ROI_COL, "nunique"),
+            n_cells_patient_total=("n_cells_core", "sum"),
+            n_informative_patient_total=("n_informative_core", "sum"),
+            n_isolated_patient_total=("n_isolated_core", "sum"),
+        )
+    )
+    totals["frac_isolated_patient_total"] = (
+        totals["n_isolated_patient_total"] / (totals["n_cells_patient_total"] + EPS)
+    )
+
+    out = totals.merge(pat_med, on=PAT_COL, how="left")
+    out.to_csv(DIRS["05_patient_level"] / "patient_level_LDA_core_median.csv", index=False)
+    return out
+
+def weighted_mean_from_core_table(sub: pd.DataFrame, value_col: str, weight_col: str) -> float:
+    if value_col not in sub.columns or weight_col not in sub.columns:
+        return np.nan
+
+    x = pd.to_numeric(sub[value_col], errors="coerce").astype(float).values
+    w = pd.to_numeric(sub[weight_col], errors="coerce").fillna(0).astype(float).values
+    mask = np.isfinite(x) & np.isfinite(w) & (w > 0)
+
+    if not np.any(mask):
+        return np.nan
+    return float(np.sum(x[mask] * w[mask]) / (np.sum(w[mask]) + EPS))
+
+def patient_informative_weighted(core_feat: pd.DataFrame) -> pd.DataFrame:
+    motifs = sorted(
+        {c.split("__")[-1] for c in core_feat.columns if c.startswith("GLOBAL__Motif")},
+        key=motif_sort_key
+    )
+    patients = sorted(core_feat[PAT_COL].astype(str).unique().tolist())
+    rows = []
+
+    for pid in patients:
+        sub = core_feat[core_feat[PAT_COL].astype(str) == pid].copy()
+        row = {
+            PAT_COL: pid,
+            "n_cores": int(sub[ROI_COL].nunique()),
+            "GLOBAL_W__n_informative_total": float(sub["n_informative_core"].sum()),
+            "GLOBAL_W__n_isolated_total": float(sub["n_isolated_core"].sum()),
+            "GLOBAL_W__frac_isolated": float(sub["n_isolated_core"].sum() / (sub["n_cells_core"].sum() + EPS)),
+        }
+
+        for m in motifs:
+            row[f"GLOBAL_W__{m}"] = weighted_mean_from_core_table(sub, f"GLOBAL__{m}", "n_informative_core")
+
+        for comp in ["TUMOUR", "CAF", "IMMUNE"]:
+            wcol = f"{comp}__n_informative"
+            row[f"{comp}_W__n_informative_total"] = float(sub[wcol].sum()) if wcol in sub.columns else 0.0
+            for m in motifs:
+                row[f"{comp}_W__{m}"] = weighted_mean_from_core_table(sub, f"{comp}__{m}", wcol)
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    out.to_csv(DIRS["05_patient_level"] / "patient_level_LDA_informative_weighted.csv", index=False)
+    return out
+
+
+# =========================================================
+# PLOTS
+# =========================================================
+
+def plot_stacked_bar(df_wide: pd.DataFrame,
+                     out_png: Path,
+                     title: str,
+                     ylabel: str,
+                     palette: Optional[dict] = None):
+    if df_wide.empty or df_wide.shape[1] == 0:
+        (out_png.with_suffix(".txt")).write_text("No data available for stacked bar plot.\n")
+        return
+
+    plot_df = df_wide.copy()
+    plot_df = plot_df.fillna(0.0)
+
+    fig_w = max(12, 0.18 * len(plot_df))
+    fig, ax = plt.subplots(figsize=(fig_w, 6.5))
+
+    bottom = np.zeros(len(plot_df))
+    x = np.arange(len(plot_df))
+
+    for col in plot_df.columns:
+        color = palette.get(col, None) if palette is not None else None
+        ax.bar(x, plot_df[col].values, bottom=bottom, width=0.85, label=col, color=color)
+        bottom += plot_df[col].values
+
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("Patient")
+    ax.set_xticks(x)
+    ax.set_xticklabels(plot_df.index.astype(str).tolist(), rotation=90, fontsize=7)
+    ax.set_ylim(0, 1.02)
+    ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=8)
+    plt.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+def make_patient_stacked_bars(pat_core_median: pd.DataFrame, theta_all: np.ndarray):
+    motifs = [f"Motif{t+1}" for t in range(theta_all.shape[1])]
+    palette = make_palette(motifs + [ISOLATED_LABEL])
+
+    dom_cols = [c for c in pat_core_median.columns if c.startswith("DOMPROP__")]
+    dom_map = {c: c.replace("DOMPROP__", "") for c in dom_cols}
+    dom_cols = sorted(
+        dom_cols,
+        key=lambda c: (dom_map[c] == ISOLATED_LABEL, motif_sort_key(dom_map[c]) if dom_map[c].startswith("Motif") else 10**9)
+    )
+    dom_df = pat_core_median[[PAT_COL] + dom_cols].copy()
+    dom_df = dom_df.set_index(PAT_COL)
+    dom_df.columns = [dom_map[c] for c in dom_cols]
+
+    plot_stacked_bar(
+        df_wide=dom_df,
+        out_png=DIRS["07_figures"] / "Patient_dominant_neighbourhoods_stackedbar_coremedian.png",
+        title="Patient-level dominant neighbourhood proportions (core-level median)",
+        ylabel="Proportion of cells",
+        palette=palette
+    )
+    dom_df.to_csv(DIRS["05_patient_level"] / "patient_dominant_neighbourhood_proportions_coremedian.csv")
+
+    glob_cols = sorted(
+        [c for c in pat_core_median.columns if c.startswith("GLOBAL__Motif")],
+        key=lambda c: motif_sort_key(c.split("__")[-1])
+    )
+    glob_df = pat_core_median[[PAT_COL] + glob_cols].copy()
+    glob_df = glob_df.set_index(PAT_COL)
+    glob_df.columns = [c.split("__")[-1] for c in glob_cols]
+    glob_df = glob_df.div(glob_df.sum(axis=1).replace(0, np.nan), axis=0)
+
+    plot_stacked_bar(
+        df_wide=glob_df,
+        out_png=DIRS["07_figures"] / "Patient_GLOBAL_motif_burdens_stackedbar_coremedian.png",
+        title="Patient-level global motif burdens (core-level median, row-normalised)",
+        ylabel="Proportion of motif burden",
+        palette=palette
+    )
+    glob_df.to_csv(DIRS["05_patient_level"] / "patient_GLOBAL_motif_burdens_proportions_coremedian.csv")
+
+def make_patient_clustermap(pat_core_median: pd.DataFrame):
+    motif_cols = sorted(
+        [c for c in pat_core_median.columns if c.startswith("GLOBAL__Motif")],
+        key=lambda c: motif_sort_key(c.split("__")[-1])
+    )
+    if len(motif_cols) < 2 or len(pat_core_median) < 2:
+        return
+
+    mat = pat_core_median.set_index(PAT_COL)[motif_cols].copy()
+    g = sns.clustermap(mat, cmap="mako", figsize=(10, 10))
+    g.fig.suptitle("Patient-level GLOBAL motif burdens (core-level motif mean, patient-level median)", y=1.02)
+    g.fig.tight_layout()
+    g.fig.savefig(DIRS["07_figures"] / "Patient_GLOBAL_motif_burdens_clustermap.png", dpi=300)
+    plt.close(g.fig)
+
+def representative_patient_neighbourhood_maps(theta_all: np.ndarray,
+                                              cell_meta: pd.DataFrame,
+                                              core_feat: pd.DataFrame,
+                                              patient_table: pd.DataFrame,
+                                              n_patients_per_motif: int = 6,
+                                              ncols: int = 3,
+                                              dominance_threshold: Optional[float] = None):
+    motifs = [f"Motif{t+1}" for t in range(theta_all.shape[1])]
+    palette = make_palette(motifs + [ISOLATED_LABEL])
+
+    df = cell_meta[[PAT_COL, CORE_COL, ROI_COL, BLOCK_COL, X_COL, Y_COL, "is_isolated"]].copy()
+    dom = assign_dominant_neighbourhood(
+        theta_all=theta_all,
+        is_isolated=df["is_isolated"].astype(bool).values,
+        dominance_threshold=dominance_threshold
+    )
+    df["Dominant_Neighbourhood"] = dom["Dominant_Neighbourhood"].values
+
+    outdir = DIRS["07_figures"] / "Representative_Patient_Neighbourhood_Maps"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    patient_global_cols = sorted(
+        [c for c in patient_table.columns if c.startswith("GLOBAL__Motif")],
+        key=lambda c: motif_sort_key(c.split("__")[-1])
+    )
+
+    legend_order = motifs.copy()
+    if dominance_threshold is not None:
+        legend_order += [MIXED_LABEL]
+        palette[MIXED_LABEL] = (0.55, 0.55, 0.55)
+    legend_order += [ISOLATED_LABEL]
+
+    for col in patient_global_cols:
+        motif = col.split("__")[-1]
+        tmp_pat = patient_table[[PAT_COL, col]].dropna().copy()
+        if tmp_pat.empty:
+            continue
+
+        tmp_pat = tmp_pat.sort_values(col, ascending=False).head(n_patients_per_motif)
+        rep_patients = tmp_pat[PAT_COL].astype(str).tolist()
+        if len(rep_patients) == 0:
+            continue
+
+        n = len(rep_patients)
+        ncols_use = min(ncols, n)
+        nrows_use = int(np.ceil(n / ncols_use))
+
+        fig, axes = plt.subplots(
+            nrows_use, ncols_use,
+            figsize=(5.2 * ncols_use, 4.9 * nrows_use),
+            squeeze=False
+        )
+        axes = axes.flatten()
+
+        for ax_i, pid in enumerate(rep_patients):
+            ax = axes[ax_i]
+
+            core_col = f"GLOBAL__{motif}"
+            sub_core = core_feat[core_feat[PAT_COL].astype(str) == str(pid)].copy()
+            sub_core = sub_core.dropna(subset=[core_col])
+            if sub_core.empty:
+                ax.axis("off")
+                continue
+
+            best_core_row = sub_core.sort_values(core_col, ascending=False).iloc[0]
+            rid = str(best_core_row[ROI_COL])
+            cid = str(best_core_row[CORE_COL])
+
+            sub = df[
+                (df[PAT_COL].astype(str) == str(pid)) &
+                (df[ROI_COL].astype(str) == rid)
+            ].copy()
+
+            if sub.empty:
+                ax.axis("off")
+                continue
+
+            for cls in legend_order:
+                s = sub[sub["Dominant_Neighbourhood"] == cls]
+                if s.empty:
+                    continue
+                ax.scatter(
+                    s[X_COL].values,
+                    s[Y_COL].values,
+                    s=6,
+                    c=[palette[cls]],
+                    label=cls
+                )
+
+            ax.set_title(f"Patient {pid}\nCore {cid}\nTop motif basis: {motif}", fontsize=10)
+            ax.set_xlabel("X (µm)")
+            ax.set_ylabel("Y (µm)")
+            ax.set_aspect("equal", adjustable="box")
+
+        for j in range(n, len(axes)):
+            axes[j].axis("off")
+
+        handles = [
+            plt.Line2D([0], [0], marker='o', linestyle='', markersize=5,
+                       markerfacecolor=palette[k], markeredgecolor=palette[k], label=k)
+            for k in legend_order
+        ]
+
+        fig.legend(handles=handles, labels=legend_order,
+                   loc="lower center", ncol=min(len(legend_order), 6),
+                   frameon=False, bbox_to_anchor=(0.5, -0.02))
+
+        fig.suptitle(
+            f"Representative patients for {motif}\nCells coloured by dominant neighbourhood within the same TMA/core",
+            y=1.02, fontsize=13
+        )
+        fig.tight_layout()
+        fig.subplots_adjust(bottom=0.12)
+        fig.savefig(
+            outdir / f"{safe_name(motif)}_representative_patient_neighbourhood_map.png",
+            dpi=300, bbox_inches="tight"
+        )
+        plt.close(fig)
+
+
+# =========================================================
+# TRUE NEIGHBOURHOOD ↔ NEIGHBOURHOOD NETWORKS
+# =========================================================
+
+def connected_components_radius(coords: np.ndarray, radius: float) -> List[np.ndarray]:
+    n = len(coords)
+    if n == 0:
+        return []
+
+    parent = np.arange(n, dtype=int)
+    rank = np.zeros(n, dtype=int)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    tree = cKDTree(coords)
+    for a, b in tree.query_pairs(r=float(radius)):
+        union(int(a), int(b))
+
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = find(i)
+        groups.setdefault(r, []).append(i)
+
+    return [np.array(v, dtype=int) for v in groups.values()]
+
+def min_distance_between_coords(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
+    if len(coords_a) == 0 or len(coords_b) == 0:
+        return np.inf
+    if len(coords_a) <= len(coords_b):
+        tree = cKDTree(coords_b)
+        d, _ = tree.query(coords_a, k=1)
+        return float(np.min(d))
+    else:
+        tree = cKDTree(coords_a)
+        d, _ = tree.query(coords_b, k=1)
+        return float(np.min(d))
+
+def build_neighbourhood_patch_networks(theta_all: np.ndarray, cell_meta: pd.DataFrame) -> pd.DataFrame:
+    motifs = [f"Motif{t+1}" for t in range(theta_all.shape[1])]
+
+    df = cell_meta.copy()
+    dom = assign_dominant_neighbourhood(
+        theta_all=theta_all,
+        is_isolated=df["is_isolated"].astype(bool).values,
+        dominance_threshold=DOMINANCE_THRESHOLD
+    )
+    df["Dominant_Class"] = dom["Dominant_Neighbourhood"].values
+
+    # informative motif-labelled cells only
+    valid_classes = set(motifs)
+    df = df[df["Dominant_Class"].isin(valid_classes)].copy()
+
+    edge_pairs = [(motifs[i], motifs[j]) for i in range(len(motifs)) for j in range(i + 1, len(motifs))]
+    rows = []
+
+    for (pid, rid), sub in df.groupby([PAT_COL, ROI_COL], sort=False):
+        roi_total_inf_cells = int(len(sub))
+
+        row = {
+            PAT_COL: str(pid),
+            ROI_COL: str(rid),
+            CORE_COL: str(sub[CORE_COL].iloc[0]),
+            BLOCK_COL: str(sub[BLOCK_COL].iloc[0]),
+            "n_informative_cells_roi": roi_total_inf_cells,
+            "n_retained_patch_cells_roi": 0,
+            "n_patches_roi": 0,
+            "n_patch_contacts_roi": 0,
+            "frac_informative_cells_in_retained_patches": np.nan,
+        }
+
+        for m in motifs:
+            row[f"NODE__{m}"] = 0.0
+            row[f"NPATCH__{m}"] = 0.0
+
+        for a, b in edge_pairs:
+            row[f"EDGE__{a}__{b}"] = np.nan
+            row[f"EDGECOUNT__{a}__{b}"] = np.nan
+
+        patches = []
+        patch_id = 0
+
+        for m in motifs:
+            sm = sub[sub["Dominant_Class"] == m].copy()
+            if sm.empty:
+                continue
+
+            coords = sm[[X_COL, Y_COL]].to_numpy(float)
+            comps = connected_components_radius(coords, PATCH_RADIUS_UM)
+
+            kept = [comp for comp in comps if len(comp) >= PATCH_MIN_CELLS]
+            row[f"NPATCH__{m}"] = float(len(kept))
+
+            for comp in kept:
+                comp_df = sm.iloc[comp].copy()
+                patch_coords = comp_df[[X_COL, Y_COL]].to_numpy(float)
+                patch = {
+                    "patch_id": patch_id,
+                    "motif": m,
+                    "n_cells": int(len(comp_df)),
+                    "coords": patch_coords,
+                }
+                patches.append(patch)
+                patch_id += 1
+                row[f"NODE__{m}"] += int(len(comp_df))
+
+        row["n_patches_roi"] = int(len(patches))
+        row["n_retained_patch_cells_roi"] = int(sum(p["n_cells"] for p in patches))
+        row["frac_informative_cells_in_retained_patches"] = (
+            row["n_retained_patch_cells_roi"] / (roi_total_inf_cells + EPS)
+            if roi_total_inf_cells > 0 else np.nan
+        )
+
+        # node burden as fraction of informative cells in ROI
+        for m in motifs:
+            row[f"NODE__{m}"] = float(row[f"NODE__{m}"] / (roi_total_inf_cells + EPS))
+
+        if len(patches) < 2:
+            rows.append(row)
+            continue
+
+        edge_weight_map = {f"EDGE__{a}__{b}": 0.0 for a, b in edge_pairs}
+        edge_count_map = {f"EDGECOUNT__{a}__{b}": 0 for a, b in edge_pairs}
+        total_weight = 0.0
+        total_contacts = 0
+
+        for i in range(len(patches)):
+            pi = patches[i]
+            for j in range(i + 1, len(patches)):
+                pj = patches[j]
+
+                if pi["motif"] == pj["motif"]:
+                    continue
+
+                dmin = min_distance_between_coords(pi["coords"], pj["coords"])
+                if not np.isfinite(dmin) or dmin > PATCH_INTERACT_RADIUS_UM:
+                    continue
+
+                a, b = sorted([pi["motif"], pj["motif"]], key=motif_sort_key)
+                edge_col = f"EDGE__{a}__{b}"
+                edgecount_col = f"EDGECOUNT__{a}__{b}"
+
+                # closer patch contacts contribute more
+                w = max(0.0, 1.0 - (dmin / PATCH_INTERACT_RADIUS_UM))
+
+                edge_weight_map[edge_col] += float(w)
+                edge_count_map[edgecount_col] += 1
+                total_weight += float(w)
+                total_contacts += 1
+
+        row["n_patch_contacts_roi"] = int(total_contacts)
+
+        if total_contacts > 0 and total_weight > 0:
+            for k, v in edge_weight_map.items():
+                row[k] = float(v / (total_weight + EPS))
+            for k, v in edge_count_map.items():
+                row[k] = float(v)
+        else:
+            for k in edge_weight_map.keys():
+                row[k] = np.nan
+            for k in edge_count_map.keys():
+                row[k] = 0.0
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    out.to_csv(DIRS["04_core_level"] / "core_level_neighbourhood_patch_networks.csv", index=False)
+    return out
+
+def patient_median_neighbourhood_networks(roi_net: pd.DataFrame) -> pd.DataFrame:
+    if roi_net.empty:
+        out = pd.DataFrame(columns=[PAT_COL])
+        out.to_csv(DIRS["05_patient_level"] / "patient_level_neighbourhood_network_coremedian.csv", index=False)
+        return out
+
+    numeric_cols = roi_net.select_dtypes(include=[np.number]).columns.tolist()
+
+    pat_med = (
+        roi_net.groupby(PAT_COL, as_index=False)[numeric_cols]
+        .median()
+    )
+
+    counts = (
+        roi_net.groupby(PAT_COL, as_index=False)
+        .agg(
+            n_cores=(ROI_COL, "nunique"),
+            n_patches_total=("n_patches_roi", "sum"),
+            n_patch_contacts_total=("n_patch_contacts_roi", "sum"),
+            n_retained_patch_cells_total=("n_retained_patch_cells_roi", "sum"),
+        )
+    )
+
+    out = counts.merge(pat_med, on=PAT_COL, how="left")
+    out.to_csv(DIRS["05_patient_level"] / "patient_level_neighbourhood_network_coremedian.csv", index=False)
+    return out
+
+def parse_edge_col(col: str) -> Tuple[str, str]:
+    _, a, b = col.split("__")
+    return a, b
+
+def extract_edge_values_from_row(row: pd.Series) -> np.ndarray:
+    edge_cols = [c for c in row.index if c.startswith("EDGE__")]
+    vals = []
+    for c in edge_cols:
+        v = row.get(c, np.nan)
+        if pd.notna(v) and float(v) > 0:
+            vals.append(float(v))
+    return np.asarray(vals, dtype=float) if vals else np.asarray([], dtype=float)
+
+def shared_edge_max(rows: List[pd.Series]) -> Optional[float]:
+    vals = []
+    for row in rows:
+        x = extract_edge_values_from_row(row)
+        if x.size:
+            vals.append(x)
+    if not vals:
+        return None
+    return float(np.nanmax(np.concatenate(vals)))
+
+def plot_weighted_network_from_row(row: pd.Series,
+                                   motifs: List[str],
+                                   out_png: Path,
+                                   title: str,
+                                   layout_pos: Optional[dict] = None,
+                                   edge_vmax: Optional[float] = None):
+    edge_cols = [c for c in row.index if c.startswith("EDGE__")]
+    G = nx.Graph()
+    pal = sns.color_palette("tab20", n_colors=max(len(motifs), 3))
+    color_map = {m: pal[i] for i, m in enumerate(motifs)}
+
+    for m in motifs:
+        val = float(row.get(f"NODE__{m}", 0.0))
+        if not np.isfinite(val):
+            val = 0.0
+        G.add_node(m, weight=val)
+
+    edges = []
+    for c in edge_cols:
+        val = row.get(c, np.nan)
+        if pd.isna(val) or float(val) <= 0:
+            continue
+        a, b = parse_edge_col(c)
+        edges.append((a, b, float(val)))
+
+    edges = sorted(edges, key=lambda x: x[2], reverse=True)[:NETWORK_TOP_EDGES]
+    for a, b, w in edges:
+        G.add_edge(a, b, weight=w)
+
+    if layout_pos is None:
+        if G.number_of_edges() > 0:
+            layout_pos = nx.spring_layout(G, seed=NETWORK_LAYOUT_SEED, weight="weight")
+        else:
+            layout_pos = nx.circular_layout(G)
+
+    node_sizes = [
+        NETWORK_NODE_SIZE_BASE + NETWORK_NODE_SIZE_SCALE * float(G.nodes[m]["weight"])
+        for m in G.nodes()
+    ]
+    node_colors = [color_map[m] for m in G.nodes()]
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_facecolor("#f0f0f0")
+
+    nx.draw_networkx_nodes(
+        G, pos=layout_pos,
+        node_size=node_sizes,
+        node_color=node_colors,
+        edgecolors="none",
+        ax=ax
+    )
+
+    if G.number_of_edges() > 0:
+        ew = np.array([G[u][v]["weight"] for u, v in G.edges()], dtype=float)
+        denom = edge_vmax if (edge_vmax is not None and edge_vmax > 0) else np.max(ew)
+        denom = max(float(denom), EPS)
+        ew_scaled = NETWORK_EDGE_WIDTH_SCALE * (ew / denom)
+        ew_alpha = 0.15 + 0.85 * np.clip(ew / denom, 0, 1)
+
+        for (u, v), w, a in zip(G.edges(), ew_scaled, ew_alpha):
+            nx.draw_networkx_edges(
+                G, pos=layout_pos,
+                edgelist=[(u, v)],
+                width=float(w),
+                edge_color="grey",
+                alpha=float(a),
+                ax=ax
+            )
+
+    nx.draw_networkx_labels(
+        G, pos=layout_pos,
+        font_size=11,
+        font_color="black",
+        ax=ax
+    )
+
+    ax.set_title(title, fontsize=14)
+    ax.axis("off")
+    plt.tight_layout()
+    fig.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return layout_pos
+
+def neighbourhood_network_survival_plots(patient_net: pd.DataFrame, surv: pd.DataFrame):
+    outdir = DIRS["07_figures"] / "Neighbourhood_Networks_By_Survival"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if patient_net.empty:
+        (outdir / "EMPTY_patient_network_table.txt").write_text("No patient network table available.\n")
+        return
+
+    surv2 = ensure_survival_groups(surv)
+    df = patient_net.merge(
+        surv2[[PAT_COL, "OS_days", "OS_event", SURV_GROUP_NAME]],
+        on=PAT_COL,
+        how="inner"
+    ).copy()
+
+    motifs = sorted(
+        [c.replace("NODE__", "") for c in df.columns if c.startswith("NODE__")],
+        key=motif_sort_key
+    )
+    if len(motifs) < 2:
+        (outdir / "TOO_FEW_MOTIFS.txt").write_text("Need at least 2 motifs for network plotting.\n")
+        return
+
+    group_order = [g for g in SURV_GROUP_ORDER if g in df[SURV_GROUP_NAME].astype(str).unique().tolist()]
+    if not group_order:
+        group_order = sorted(df[SURV_GROUP_NAME].astype(str).unique().tolist())
+
+    feature_cols = [c for c in df.columns if c.startswith("NODE__") or c.startswith("EDGE__")]
+    overall = df[feature_cols].mean(numeric_only=True)
+
+    group_rows = []
+    group_ns = {}
+    for grp in group_order:
+        sub = df[df[SURV_GROUP_NAME].astype(str) == str(grp)].copy()
+        if len(sub) < NETWORK_MIN_GROUP_N:
+            continue
+        group_ns[grp] = len(sub)
+        group_rows.append((grp, sub[feature_cols].mean(numeric_only=True)))
+
+    all_rows = [overall] + [r for _, r in group_rows]
+    edge_vmax_shared = shared_edge_max(all_rows)
+
+    # Overall defines fixed layout
+    layout_pos = plot_weighted_network_from_row(
+        overall,
+        motifs=motifs,
+        out_png=outdir / "Neighbourhood_network_OVERALL.png",
+        title="Overall weighted neighbourhood communication network",
+        layout_pos=None,
+        edge_vmax=edge_vmax_shared
+    )
+
+    for grp, row in group_rows:
+        plot_weighted_network_from_row(
+            row,
+            motifs=motifs,
+            out_png=outdir / f"Neighbourhood_network_{safe_name(grp)}.png",
+            title=f"Weighted neighbourhood communication network — {grp} survival (n={group_ns[grp]})",
+            layout_pos=layout_pos,
+            edge_vmax=edge_vmax_shared
+        )
+
+    pd.DataFrame({
+        "shared_edge_vmax": [edge_vmax_shared]
+    }).to_csv(outdir / "Neighbourhood_network_shared_edge_scale.csv", index=False)
+
+    df.to_csv(outdir / "patient_level_neighbourhood_networks_with_survival.csv", index=False)
+
+def neighbourhood_network_survival_stats(patient_net: pd.DataFrame, surv: pd.DataFrame):
+    outdir = DIRS["06_survival"] / "neighbourhood_networks"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if patient_net.empty:
+        (outdir / "EMPTY_patient_network_table.txt").write_text("No patient network table available.\n")
+        return
+
+    surv2 = ensure_survival_groups(surv)
+    df = patient_net.merge(
+        surv2[[PAT_COL, SURV_GROUP_NAME, "OS_days", "OS_event"]],
+        on=PAT_COL,
+        how="inner"
+    ).copy()
+
+    # Include both relative composition and burden/count features
+    test_cols = [
+        c for c in df.columns
+        if (
+            c.startswith("NODE__")
+            or c.startswith("EDGE__")
+            or c.startswith("NPATCH__")
+            or c.startswith("EDGECOUNT__")
+            or "n_patch_contacts" in c
+            or "n_patches" in c
+            or "n_retained_patch_cells" in c
+            or "frac_informative_cells_in_retained_patches" in c
+        )
+    ]
+
+    rows = []
+    for col in test_cols:
+        groups = []
+        group_names = []
+        for grp in SURV_GROUP_ORDER:
+            vals = df[df[SURV_GROUP_NAME].astype(str) == grp][col].dropna().astype(float)
+            if len(vals) > 0:
+                groups.append(vals.values)
+                group_names.append(grp)
+
+        if len(groups) < 2:
+            continue
+
+        try:
+            _, p = kruskal(*groups)
+        except Exception:
+            continue
+
+        row = {
+            "feature": col,
+            "KW_p": float(p),
+        }
+        for grp in group_names:
+            vals = df[df[SURV_GROUP_NAME].astype(str) == grp][col].dropna().astype(float)
+            row[f"{grp}_median"] = float(vals.median()) if len(vals) else np.nan
+            row[f"{grp}_mean"] = float(vals.mean()) if len(vals) else np.nan
+            row[f"n_{grp}"] = int(len(vals))
+        rows.append(row)
+
+    tab = pd.DataFrame(rows)
+    if tab.empty:
+        (outdir / "EMPTY_network_KW.txt").write_text("No neighbourhood-network survival tests could be run.\n")
+        return
+
+    tab["KW_p_FDR"] = bh_fdr(tab["KW_p"])
+    tab = tab.sort_values(["KW_p_FDR", "KW_p"], ascending=[True, True])
+    tab.to_csv(outdir / "Neighbourhood_network_features_KW_FDR.csv", index=False)
+
+
+# =========================================================
+# TRIANGLE HEATMAPS FOR NEIGHBOURHOOD NETWORKS
+# =========================================================
+
+def build_edge_matrix_from_row(row: pd.Series, motifs: List[str]) -> pd.DataFrame:
+    """
+    Build a symmetric motif x motif matrix from EDGE__MotifA__MotifB columns.
+    Diagonal is NaN because self-edges are not used in this network definition.
+    """
+    M = pd.DataFrame(np.nan, index=motifs, columns=motifs, dtype=float)
+
+    for i, a in enumerate(motifs):
+        for j, b in enumerate(motifs):
+            if i == j:
+                M.loc[a, b] = np.nan
+                continue
+            x, y = sorted([a, b], key=motif_sort_key)
+            col = f"EDGE__{x}__{y}"
+            val = row.get(col, np.nan)
+            M.loc[a, b] = float(val) if pd.notna(val) else np.nan
+
+    return M
+
+def aggregate_group_edge_matrix(df: pd.DataFrame,
+                                motifs: List[str],
+                                group_col: Optional[str] = None,
+                                group_value: Optional[str] = None,
+                                stat: str = "median") -> pd.DataFrame:
+    """
+    Aggregate patient-level edge features into one symmetric motif x motif matrix.
+    """
+    use = df.copy()
+    if group_col is not None and group_value is not None:
+        use = use[use[group_col].astype(str) == str(group_value)].copy()
+
+    edge_cols = [c for c in use.columns if c.startswith("EDGE__")]
+    if len(use) == 0 or len(edge_cols) == 0:
+        return pd.DataFrame(np.nan, index=motifs, columns=motifs)
+
+    if stat == "mean":
+        agg_row = use[edge_cols].mean(numeric_only=True)
+    else:
+        agg_row = use[edge_cols].median(numeric_only=True)
+
+    return build_edge_matrix_from_row(agg_row, motifs)
+
+def save_edge_matrix_csv(mat: pd.DataFrame, out_csv: Path):
+    mat.to_csv(out_csv, index=True)
+
+def shared_heatmap_limits(mats: List[pd.DataFrame]) -> Tuple[Optional[float], Optional[float]]:
+    vals = []
+    for mat in mats:
+        if mat is None or mat.empty:
+            continue
+        x = mat.values[np.isfinite(mat.values)]
+        if x.size:
+            vals.append(x)
+
+    if not vals:
+        return None, None
+
+    all_vals = np.concatenate(vals)
+    return float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
+
+def plot_triangle_heatmap(mat: pd.DataFrame,
+                          out_png: Path,
+                          title: str,
+                          cmap: str = "mako",
+                          vmin: Optional[float] = None,
+                          vmax: Optional[float] = None,
+                          annot: bool = False):
+    """
+    Lower-triangle heatmap of a symmetric interaction matrix.
+    """
+    if mat.empty:
+        (out_png.with_suffix(".txt")).write_text("No matrix available.\n")
+        return
+
+    plot_mat = mat.copy()
+    mask = np.triu(np.ones_like(plot_mat, dtype=bool), k=0)
+
+    fig_w = max(8, 0.45 * len(plot_mat.columns) + 3)
+    fig_h = max(7, 0.42 * len(plot_mat.index) + 2)
+
+    plt.figure(figsize=(fig_w, fig_h))
+    sns.heatmap(
+        plot_mat,
+        mask=mask,
+        cmap=cmap,
+        square=True,
+        linewidths=0.3,
+        linecolor="lightgrey",
+        cbar_kws={"shrink": 0.8, "label": "Interaction strength"},
+        vmin=vmin,
+        vmax=vmax,
+        annot=annot,
+        fmt=".2f"
+    )
+    plt.title(title)
+    plt.xlabel("")
+    plt.ylabel("")
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close()
+
+def plot_triangle_heatmap_diff(mat_a: pd.DataFrame,
+                               mat_b: pd.DataFrame,
+                               out_png: Path,
+                               title: str,
+                               cmap: str = "coolwarm",
+                               annot: bool = False):
+    """
+    Lower-triangle heatmap of matrix difference: mat_a - mat_b
+    """
+    if mat_a.empty or mat_b.empty:
+        (out_png.with_suffix(".txt")).write_text("No matrices available for difference heatmap.\n")
+        return
+
+    diff = mat_a - mat_b
+    finite_vals = diff.values[np.isfinite(diff.values)]
+    vmax = float(np.nanmax(np.abs(finite_vals))) if finite_vals.size else 1.0
+    vmax = max(vmax, 1e-6)
+
+    mask = np.triu(np.ones_like(diff, dtype=bool), k=0)
+
+    fig_w = max(8, 0.45 * len(diff.columns) + 3)
+    fig_h = max(7, 0.42 * len(diff.index) + 2)
+
+    plt.figure(figsize=(fig_w, fig_h))
+    sns.heatmap(
+        diff,
+        mask=mask,
+        cmap=cmap,
+        square=True,
+        linewidths=0.3,
+        linecolor="lightgrey",
+        cbar_kws={"shrink": 0.8, "label": "Difference in interaction strength"},
+        vmin=-vmax,
+        vmax=vmax,
+        center=0,
+        annot=annot,
+        fmt=".2f"
+    )
+    plt.title(title)
+    plt.xlabel("")
+    plt.ylabel("")
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close()
+
+def neighbourhood_network_triangle_heatmaps(patient_net: pd.DataFrame, surv: pd.DataFrame):
+    outdir = DIRS["07_figures"] / "Neighbourhood_Network_Triangle_Heatmaps"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if patient_net.empty:
+        (outdir / "EMPTY_patient_network_table.txt").write_text("No patient network table available.\n")
+        return
+
+    surv2 = ensure_survival_groups(surv)
+    df = patient_net.merge(
+        surv2[[PAT_COL, "OS_days", "OS_event", SURV_GROUP_NAME]],
+        on=PAT_COL,
+        how="inner"
+    ).copy()
+
+    motifs = sorted(
+        [c.replace("NODE__", "") for c in df.columns if c.startswith("NODE__")],
+        key=motif_sort_key
+    )
+    if len(motifs) < 2:
+        (outdir / "TOO_FEW_MOTIFS.txt").write_text("Need at least 2 motifs for triangle heatmaps.\n")
+        return
+
+    group_order = [g for g in SURV_GROUP_ORDER if g in df[SURV_GROUP_NAME].astype(str).unique().tolist()]
+    if not group_order:
+        group_order = sorted(df[SURV_GROUP_NAME].astype(str).unique().tolist())
+
+    # Overall matrix
+    overall_mat = aggregate_group_edge_matrix(
+        df=df,
+        motifs=motifs,
+        group_col=None,
+        group_value=None,
+        stat=NETWORK_HEATMAP_STAT
+    )
+    save_edge_matrix_csv(overall_mat, outdir / "Neighbourhood_network_OVERALL_matrix.csv")
+
+    # Per-survival-group matrices
+    group_mats = {}
+    group_ns = {}
+    for grp in group_order:
+        sub = df[df[SURV_GROUP_NAME].astype(str) == str(grp)].copy()
+        if len(sub) < NETWORK_MIN_GROUP_N:
+            continue
+
+        mat = aggregate_group_edge_matrix(
+            df=df,
+            motifs=motifs,
+            group_col=SURV_GROUP_NAME,
+            group_value=grp,
+            stat=NETWORK_HEATMAP_STAT
+        )
+        group_mats[grp] = mat
+        group_ns[grp] = len(sub)
+
+        save_edge_matrix_csv(mat, outdir / f"Neighbourhood_network_{safe_name(grp)}_matrix.csv")
+
+    # Shared colour scale across survival-group heatmaps
+    vmin_shared, vmax_shared = shared_heatmap_limits(list(group_mats.values()))
+
+    # Overall heatmap uses its own scale
+    plot_triangle_heatmap(
+        overall_mat,
+        out_png=outdir / "Neighbourhood_network_OVERALL_triangle_heatmap.png",
+        title=f"Overall neighbourhood interaction matrix ({NETWORK_HEATMAP_STAT} across patients)",
+        cmap=NETWORK_HEATMAP_CMAP
+    )
+
+    # Group heatmaps use shared scale
+    for grp in group_order:
+        if grp not in group_mats:
+            continue
+
+        plot_triangle_heatmap(
+            group_mats[grp],
+            out_png=outdir / f"Neighbourhood_network_{safe_name(grp)}_triangle_heatmap.png",
+            title=f"{grp} survival neighbourhood interaction matrix ({NETWORK_HEATMAP_STAT}; n={group_ns[grp]})",
+            cmap=NETWORK_HEATMAP_CMAP,
+            vmin=vmin_shared,
+            vmax=vmax_shared
+        )
+
+    # Save shared scale for reference
+    pd.DataFrame({
+        "shared_vmin": [vmin_shared],
+        "shared_vmax": [vmax_shared],
+        "stat": [NETWORK_HEATMAP_STAT]
+    }).to_csv(outdir / "Neighbourhood_network_group_heatmap_shared_scale.csv", index=False)
+
+    # Difference heatmaps
+    diff_pairs = [
+        ("Short", "Long"),
+        ("Short", "Intermediate"),
+        ("Intermediate", "Long"),
+    ]
+    for a, b in diff_pairs:
+        if a in group_mats and b in group_mats:
+            plot_triangle_heatmap_diff(
+                group_mats[a],
+                group_mats[b],
+                out_png=outdir / f"Neighbourhood_network_DIFF_{safe_name(a)}_minus_{safe_name(b)}.png",
+                title=f"Neighbourhood interaction difference: {a} minus {b}",
+                cmap=NETWORK_DIFF_CMAP
+            )
+
+
+# =========================================================
+# SURVIVAL
+# =========================================================
+
+def km_quartile_extremes(df: pd.DataFrame, feature: str, out_png: Path, min_per_group: int = 12):
+    if not HAVE_LIFELINES:
+        return None
+
+    d = df[[feature, "OS_days", "OS_event"]].dropna().copy()
+    if len(d) < 40 or d[feature].nunique() < 2:
+        return None
+
+    d["_pct_rank"] = d[feature].rank(method="average", pct=True)
+    low = d[d["_pct_rank"] <= 0.25].copy()
+    high = d[d["_pct_rank"] >= 0.75].copy()
+
+    if len(low) < min_per_group or len(high) < min_per_group:
+        return None
+
+    km1 = KaplanMeierFitter()
+    km2 = KaplanMeierFitter()
+    fig, ax = plt.subplots(figsize=(8.2, 6.6))
+
+    km1.fit(low["OS_days"], low["OS_event"], label=f"Low (≤Q1) n={len(low)}").plot(ax=ax, ci_show=True)
+    km2.fit(high["OS_days"], high["OS_event"], label=f"High (≥Q3) n={len(high)}").plot(ax=ax, ci_show=True)
+
+    lr = logrank_test(low["OS_days"], high["OS_days"],
+                      event_observed_A=low["OS_event"],
+                      event_observed_B=high["OS_event"])
+
+    ax.set_title(f"{feature} (quartile extremes)  Log-rank p={lr.p_value:.3g}")
+    ax.set_xlabel("Days")
+    ax.set_ylabel("Survival probability")
+    add_at_risk_counts(km1, km2, ax=ax)
+    fig.subplots_adjust(bottom=0.25)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
+
+    return float(lr.p_value)
+
+def univariate_cox(df: pd.DataFrame, feature: str, penalizer: float = 0.0):
+    if not HAVE_LIFELINES:
+        return None
+
+    d = df[[feature, "OS_days", "OS_event"]].dropna().copy()
+    if len(d) < 30 or d[feature].nunique() < 2:
+        return None
+
+    d[feature] = zscore(d[feature])
+    cph = CoxPHFitter(penalizer=penalizer)
+
+    try:
+        cph.fit(d, duration_col="OS_days", event_col="OS_event")
+        s = cph.summary.loc[feature].copy()
+        return {
+            "feature": feature,
+            "coef": float(s["coef"]),
+            "HR": float(np.exp(s["coef"])),
+            "p": float(s["p"]),
+            "CI95_low": float(np.exp(s["coef lower 95%"])),
+            "CI95_high": float(np.exp(s["coef upper 95%"])),
+            "n": int(len(d)),
+        }
+    except Exception:
+        return None
+
+def forest_plot_with_q(cox_table: pd.DataFrame, outpng: Path, title: str):
+    if cox_table.empty:
+        return
+
+    d = cox_table.sort_values("q", ascending=True).copy()
+    if len(d) > 30:
+        d = d.head(30).copy()
+
+    y = np.arange(len(d))
+    hr = d["HR"].values
+    lo = d["CI95_low"].values
+    hi = d["CI95_high"].values
+
+    labels = [f"{r['feature']}  (q={r['q']:.3g})" for _, r in d.iterrows()]
+
+    fig_h = max(6, 0.35 * len(d) + 2.0)
+    fig, ax = plt.subplots(figsize=(10, fig_h))
+    ax.hlines(y, lo, hi, lw=2)
+    ax.plot(hr, y, "o")
+    ax.axvline(1.0, linestyle="--")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8.5)
+    ax.set_xlabel("Hazard Ratio (per 1 SD)")
+    ax.set_title(title)
+    ax.invert_yaxis()
+    ax.grid(True, axis="x", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(outpng, dpi=300)
+    plt.close(fig)
+
+def run_survival(patient_table: pd.DataFrame, surv: pd.DataFrame, table_tag: str):
+    outdir = DIRS["06_survival"] / table_tag
+    outdir.mkdir(parents=True, exist_ok=True)
+    km_dir = outdir / "KM_quartile_extremes"
+    km_dir.mkdir(parents=True, exist_ok=True)
+
+    df = patient_table.merge(surv, on=PAT_COL, how="inner")
+    df.to_csv(outdir / f"{table_tag}_with_survival.csv", index=False)
+
+    feature_cols = [
+        c for c in df.columns
+        if c not in [PAT_COL, "OS_days", "OS_event", SURV_GROUP_NAME]
+        and (
+            c.startswith("GLOBAL__Motif")
+            or c.startswith("TUMOUR__Motif")
+            or c.startswith("CAF__Motif")
+            or c.startswith("IMMUNE__Motif")
+            or c.startswith("GLOBAL_W__Motif")
+            or c.startswith("TUMOUR_W__Motif")
+            or c.startswith("CAF_W__Motif")
+            or c.startswith("IMMUNE_W__Motif")
+            or c.startswith("DOMPROP__")
+            or c.startswith("DOMPROP_INF__")
+            or c.startswith("NODE__")
+            or c.startswith("EDGE__")
+            or c.startswith("NPATCH__")
+            or c.startswith("EDGECOUNT__")
+            or "frac_isolated" in c
+            or "median_neigh_count" in c
+            or "n_patch_contacts" in c
+            or "n_patches" in c
+            or "n_retained_patch_cells" in c
+            or "frac_informative_cells_in_retained_patches" in c
+        )
+    ]
+
+    if not feature_cols:
+        (outdir / "NO_FEATURES_FOUND.txt").write_text("No eligible feature columns detected.\n")
+        return
+
+    if not HAVE_LIFELINES:
+        (outdir / "README_lifelines.txt").write_text("lifelines not installed; KM/Cox skipped.\n")
+        return
+
+    km_rows = []
+    for f in feature_cols:
+        p = km_quartile_extremes(df, f, km_dir / f"KM_{safe_name(f)}.png", min_per_group=12)
+        if p is not None:
+            km_rows.append({"feature": f, "logrank_p": p})
+
+    if km_rows:
+        km_tab = pd.DataFrame(km_rows).sort_values("logrank_p")
+        km_tab["q"] = bh_fdr(km_tab["logrank_p"])
+        km_tab.to_csv(outdir / "KM_logrank_pvalues_with_FDR.csv", index=False)
+
+    cox_rows = []
+    for f in feature_cols:
+        res = univariate_cox(df, f, penalizer=0.0)
+        if res is not None:
+            cox_rows.append(res)
+
+    cox = pd.DataFrame(cox_rows)
+    if not cox.empty:
+        cox["q"] = bh_fdr(cox["p"])
+        cox.sort_values("q").to_csv(outdir / "Cox_univariate_features_with_FDR.csv", index=False)
+        forest_plot_with_q(cox, outdir / "Forest_Cox_univariate_features.png",
+                           title=f"Univariate Cox (per 1 SD) — {table_tag}")
+    else:
+        (outdir / "EMPTY_COX.txt").write_text("No Cox models converged / insufficient samples.\n")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    print("=== Spatial-LDA using tumour=Main_Cell_Type and non-tumour=Final_Phenotype ===")
+    print(f"FINAL_CSV : {FINAL_CSV}")
+    print(f"CLIN_CSV  : {CLIN_CSV}")
+    print(f"OUTDIR    : {BASE_OUT}")
+    print(f"UM_PER_PX : {UM_PER_PX} µm/px")
+    print(f"Neighbourhood docs : k={K_NEIGHBORS}, R={RADIUS_UM} µm")
+    print(f"LDA method         : {LDA_LEARNING_METHOD} | max_iter={LDA_MAX_ITER}")
+    print(f"K-sweep            : {DO_K_SWEEP} | FORCE_N_TOPICS={FORCE_N_TOPICS}")
+    print(f"Patch radius       : {PATCH_RADIUS_UM} µm | patch min cells={PATCH_MIN_CELLS}")
+    print(f"Patch interaction  : {PATCH_INTERACT_RADIUS_UM} µm")
+    print(f"lifelines          : {HAVE_LIFELINES}")
+
+    snapshot_inputs()
+
+    cells = load_cells()
+    audit_core_identifier(cells)
+    surv = load_and_parse_survival(CLIN_CSV)
+
+    print(f"[load] cells={len(cells):,} patients={cells[PAT_COL].nunique():,} cores={cells[CORE_COL].nunique():,} ROIs={cells[ROI_COL].nunique():,}")
+    print(f"[load] unique hybrid labels={cells['LDA_Label'].nunique():,}")
+
+    vocab = build_vocab(cells)
+    X_all, cell_meta = build_docs_sparse(cells, vocab)
+    X_fit, cell_meta_fit, fit_mask = prepare_fit_subset(X_all, cell_meta)
+
+    if FORCE_N_TOPICS is not None:
+        K_final = int(FORCE_N_TOPICS)
+        (DIRS["02_k_sweep"] / "K_FORCED.txt").write_text(f"Forced K={K_final}\n")
+        print(f"[K] forced K={K_final}")
+    elif DO_K_SWEEP:
+        K_final = select_k_via_sweep(X_fit, cell_meta_fit)
+    else:
+        K_final = 10
+        print("[K] sweep disabled; using K=10")
+
+    lda, theta_fit, beta_df = fit_final_lda(X_fit, vocab, n_topics=K_final)
+    theta_all = expand_theta_to_all_cells(theta_fit, fit_mask)
+    _ = save_cell_assignments(theta_all, cell_meta)
+
+    core_feat = aggregate_core_level(theta_all, cell_meta)
+    pat_core_median = patient_core_median(core_feat)
+    pat_informative_weighted = patient_informative_weighted(core_feat)
+
+    make_patient_stacked_bars(pat_core_median, theta_all)
+    make_patient_clustermap(pat_core_median)
+
+    representative_patient_neighbourhood_maps(
+        theta_all=theta_all,
+        cell_meta=cell_meta,
+        core_feat=core_feat,
+        patient_table=pat_core_median,
+        n_patients_per_motif=REP_PATIENTS_PER_MOTIF,
+        ncols=REP_PATIENT_GRID_NCOLS,
+        dominance_threshold=DOMINANCE_THRESHOLD
+    )
+
+    # ---- true neighbourhood ↔ neighbourhood interaction networks ----
+    roi_net = build_neighbourhood_patch_networks(theta_all, cell_meta)
+    pat_net = patient_median_neighbourhood_networks(roi_net)
+    neighbourhood_network_survival_plots(pat_net, surv)
+    neighbourhood_network_survival_stats(pat_net, surv)
+    neighbourhood_network_triangle_heatmaps(pat_net, surv)
+
+    # ---- standard survival on motif tables ----
+    run_survival(pat_core_median, surv, table_tag="patient_LDA_core_median")
+    run_survival(pat_informative_weighted, surv, table_tag="patient_LDA_informative_weighted")
+    run_survival(pat_net, surv, table_tag="patient_neighbourhood_network_core_median")
+
+    print("=== DONE ===")
+    print("Key outputs:")
+    print(f" - {DIRS['05_patient_level'] / 'patient_level_LDA_core_median.csv'}")
+    print(f" - {DIRS['05_patient_level'] / 'patient_level_LDA_informative_weighted.csv'}")
+    print(f" - {DIRS['05_patient_level'] / 'patient_level_neighbourhood_network_coremedian.csv'}")
+    print(f" - {DIRS['03_lda'] / 'cell_assignments_all_cells.csv.gz'}")
+    print(f" - {DIRS['03_lda'] / 'LDA_theta_all_cells_nan_for_isolated.npy'}")
+    print(f" - {DIRS['07_figures'] / 'Patient_dominant_neighbourhoods_stackedbar_coremedian.png'}")
+    print(f" - {DIRS['07_figures'] / 'Patient_GLOBAL_motif_burdens_stackedbar_coremedian.png'}")
+    print(f" - neighbourhood network figures in {DIRS['07_figures'] / 'Neighbourhood_Networks_By_Survival'}")
+    print(f" - triangle heatmaps in {DIRS['07_figures'] / 'Neighbourhood_Network_Triangle_Heatmaps'}")
+    if HAVE_LIFELINES:
+        print(f" - survival outputs in {DIRS['06_survival']}")
+    else:
+        print(" - lifelines not installed, survival outputs skipped.")
+
+
+if __name__ == "__main__":
+    main()
