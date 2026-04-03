@@ -1,0 +1,1475 @@
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy.spatial import cKDTree
+from scipy.stats import kruskal, mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+
+from matplotlib.patches import Wedge, PathPatch
+from matplotlib.path import Path as MplPath
+
+
+# -------------------- UTILITIES --------------------
+
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def _canon_col(s: str) -> str:
+    s = str(s).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def find_column(df: pd.DataFrame, candidates):
+    canon_map = {_canon_col(c): c for c in df.columns}
+    for cand in candidates:
+        cc = _canon_col(cand)
+        if cc in canon_map:
+            return canon_map[cc]
+    return None
+
+
+def normalize_matrix_global(mat: pd.DataFrame) -> pd.DataFrame:
+    total = float(np.nansum(mat.values))
+    if total <= 0:
+        return mat.copy()
+    return mat / total
+
+
+def normalize_matrix_rowwise(mat: pd.DataFrame) -> pd.DataFrame:
+    out = mat.copy().astype(float)
+    row_sums = out.sum(axis=1).replace(0, np.nan)
+    out = out.div(row_sums, axis=0).fillna(0.0)
+    return out
+
+
+def median_mats(mats):
+    if len(mats) == 0:
+        return None
+
+    ref = mats[0]
+    arr = np.stack(
+        [m.reindex(index=ref.index, columns=ref.columns).to_numpy(dtype=float) for m in mats],
+        axis=0
+    )
+    med = np.nanmedian(arr, axis=0)
+    return pd.DataFrame(med, index=ref.index, columns=ref.columns)
+
+
+def epsilon_squared_kw(H, k, n):
+    denom = (n - k)
+    if denom <= 0:
+        return np.nan
+    return max(0.0, (H - k + 1.0) / denom)
+
+
+def add_core_key(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["Spot Id 1"] = df["Spot Id 1"].astype(str).str.strip()
+    df["Spot Id 2"] = df["Spot Id 2"].astype(str).str.strip()
+
+    if "TMA Block Name" in df.columns:
+        df["TMA Block Name"] = df["TMA Block Name"].astype(str).str.strip()
+        df["CORE_KEY"] = (
+            df["Spot Id 1"] + "__" +
+            df["TMA Block Name"] + "__" +
+            df["Spot Id 2"]
+        )
+    else:
+        df["CORE_KEY"] = df["Spot Id 1"] + "__" + df["Spot Id 2"]
+
+    return df
+
+
+def preprocess_clinical(
+    df: pd.DataFrame,
+    patient_col_candidates=("Spot Id 1", "SpotId1", "Donor ID", "DonorID", "Patient", "PatientID"),
+    os_days_candidates=(
+        "Overall Survival (days)",
+        "Overall_Survival_(days)",
+        "Overall Survival Days",
+        "OverallSurvivaldays",
+        "OverallSurvivalDays",
+        "OS_days",
+        "OSDays",
+    ),
+    followup_candidates=("Follow_up", "Follow up", "Followup", "FollowUp"),
+) -> pd.DataFrame:
+    """
+    Returns:
+      ['Spot Id 1', 'SurvivalDays', 'SurvivalCategory']
+    """
+    df = df.copy()
+
+    pt_col = find_column(df, patient_col_candidates)
+    if pt_col is None:
+        raise ValueError(
+            f"Could not find patient ID column. Tried: {list(patient_col_candidates)}. "
+            f"Seen: {list(df.columns)}"
+        )
+
+    os_col = find_column(df, os_days_candidates)
+    if os_col is None:
+        raise ValueError(
+            f"Could not find OS days column. Tried: {list(os_days_candidates)}. "
+            f"Seen: {list(df.columns)}"
+        )
+
+    fu_col = find_column(df, followup_candidates)
+
+    out = df.rename(columns={pt_col: "Spot Id 1", os_col: "SurvivalDays"}).copy()
+    out["Spot Id 1"] = out["Spot Id 1"].astype(str).str.strip()
+
+    out = out[~out["SurvivalDays"].astype(str).str.contains("lost to follow up", case=False, na=False)]
+
+    if fu_col is not None:
+        mask = out["SurvivalDays"].astype(str).str.strip().isin(["NA", "N/A", "nan", "None", ""])
+        out.loc[mask, "SurvivalDays"] = df.loc[out.index, fu_col]
+
+    out["SurvivalDays"] = pd.to_numeric(out["SurvivalDays"], errors="coerce")
+    out = out.dropna(subset=["Spot Id 1", "SurvivalDays"]).copy()
+
+    out = out.groupby("Spot Id 1", as_index=False)["SurvivalDays"].max()
+
+    out["SurvivalCategory"] = pd.cut(
+        out["SurvivalDays"],
+        bins=[-np.inf, 540, 900, np.inf],
+        labels=["Short", "Intermediate", "Long"]
+    )
+
+    return out[["Spot Id 1", "SurvivalDays", "SurvivalCategory"]]
+
+
+# -------------------- LABEL NORMALISATION --------------------
+
+def normalise_final_label(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    fixes = {
+        "Other immune": "Other Immune",
+        "OTHER IMMUNE": "Other Immune",
+        "Tripple negative": "Triple negative",
+        "Tripple Negative": "Triple negative",
+        "Tripple positive": "Triple positive",
+        "Tripple Positive": "Triple positive",
+    }
+    return fixes.get(s, s)
+
+
+def normalise_detailed_label(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    fixes = {
+        "Other immune": "Other Immune",
+        "OTHER IMMUNE": "Other Immune",
+        "Tripple negative": "Triple negative",
+        "Tripple positive": "Triple positive",
+    }
+    return fixes.get(s, s)
+
+
+def normalise_main_phenotype_label(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip().lower()
+
+    if s in {"tumour", "tumor", "tumour cell", "tumor cell"}:
+        return "Tumour"
+    if "tum" in s:
+        return "Tumour"
+    return str(x).strip()
+
+
+def derive_immune_main_from_detailed(x):
+    """
+    Coarse immune class derived from Detailed_Phenotype.
+    """
+    if pd.isna(x):
+        return np.nan
+
+    s = str(x).strip()
+    lc = s.lower()
+
+    if "apc" in lc:
+        return "APC"
+
+    if lc.startswith("cd4") or "treg" in lc or lc == "follicular":
+        return "CD4"
+
+    if lc.startswith("cd8"):
+        return "CD8"
+
+    if ("b cell" in lc) or (lc in {"gc-", "gc+", "gc- fdr+", "gc- fdr"}):
+        return "B Cell"
+
+    if (lc in {"m1", "m2"}) or ("macroph" in lc):
+        return "Macrophage"
+
+    if "other immune" in lc:
+        return "Other Immune"
+
+    return np.nan
+
+
+def derive_immune_main_from_final(x):
+    """
+    Immune main class derived from Final_Phenotype.
+    Used for colouring subtype-level circular plots.
+    """
+    if pd.isna(x):
+        return np.nan
+
+    s = str(x).strip()
+    lc = s.lower()
+
+    if lc == "apc":
+        return "APC"
+
+    if lc in {"b cell", "b cell fdr+"}:
+        return "B Cell"
+
+    if lc.startswith("cd4") or lc == "treg":
+        return "CD4"
+
+    if lc.startswith("cd8"):
+        return "CD8"
+
+    if lc in {"m1", "m2"} or "macroph" in lc:
+        return "Macrophage"
+
+    if "other immune" in lc:
+        return "Other Immune"
+
+    return np.nan
+
+
+def prepare_analysis_columns(
+    final_data: pd.DataFrame,
+    final_col: str,
+    detailed_col: str,
+):
+    df = final_data.copy()
+    df = add_core_key(df)
+
+    df[final_col] = df[final_col].apply(normalise_final_label)
+    df[detailed_col] = df[detailed_col].apply(normalise_detailed_label)
+
+    caf_labels_master = [
+        "Subtype A",
+        "Subtype B",
+        "Subtype C",
+        "Triple negative",
+        "Triple positive",
+    ]
+
+    immune_final_preferred_order = [
+        "APC",
+        "B Cell",
+        "B Cell FDR+",
+        "CD4 Conventional",
+        "CD8 AE",
+        "CD8 Bystander",
+        "CD8 Cytotoxic",
+        "CD8 Exhausted",
+        "M1",
+        "M2",
+        "Other Immune",
+        "Treg",
+    ]
+
+    df["CAF_Subtype"] = np.where(df[final_col].isin(caf_labels_master), df[final_col], np.nan)
+
+    df["Immune_Main_From_Detailed"] = df[detailed_col].apply(derive_immune_main_from_detailed)
+
+    df["Immune_Final_Label"] = df[final_col].where(
+        df[final_col].apply(lambda x: pd.notna(derive_immune_main_from_final(x)))
+    )
+    df["Immune_Final_Main"] = df["Immune_Final_Label"].apply(derive_immune_main_from_final)
+
+    final_present = list(pd.unique(df[final_col].dropna()))
+    caf_labels = [x for x in caf_labels_master if x in set(final_present)]
+
+    immune_main_order = [
+        x for x in ["CD4", "CD8", "B Cell", "Macrophage", "APC", "Other Immune"]
+        if x in set(df["Immune_Main_From_Detailed"].dropna().unique())
+    ]
+
+    immune_final_present = list(pd.unique(df["Immune_Final_Label"].dropna()))
+    immune_final_order = [x for x in immune_final_preferred_order if x in immune_final_present]
+    immune_final_remaining = [x for x in immune_final_present if x not in set(immune_final_order)]
+    immune_final_order.extend(sorted(immune_final_remaining))
+
+    print("[INFO] CAF labels:", caf_labels)
+    print("[INFO] Immune main classes from Detailed_Phenotype:", immune_main_order)
+    print("[INFO] Immune final phenotypes from Final_Phenotype:", immune_final_order)
+
+    return df, caf_labels, immune_main_order, immune_final_order
+
+
+# -------------------- DENSE TUMOUR / PROXIMITY FLAGS --------------------
+
+def add_dense_tumour_proximity_flags(
+    df: pd.DataFrame,
+    main_col: str,
+    radius_dense_um: float = 50.0,
+    min_other_tumour_neighbours: int = 5,
+    caf_to_tumour_um: float = 30.0,
+    microns_per_pixel: float = 0.325002431869506,
+    coords_are_pixels: bool = True,
+):
+    """
+    Adds:
+      - Is_Tumour_Main
+      - Is_Dense_Tumour_50um
+      - Dist_to_Dense_Tumour_um
+      - CAF_Proximal_30um
+
+    Returns core-level QC dataframe.
+    """
+    df = df.copy()
+
+    if "CORE_KEY" not in df.columns:
+        df = add_core_key(df)
+
+    if main_col not in df.columns:
+        raise ValueError(f"Column '{main_col}' not found in dataframe.")
+
+    df["_Main_Norm"] = df[main_col].apply(normalise_main_phenotype_label)
+    df["Is_Tumour_Main"] = df["_Main_Norm"].eq("Tumour")
+
+    df["Is_Dense_Tumour_50um"] = False
+    df["Dist_to_Dense_Tumour_um"] = np.nan
+    df["CAF_Proximal_30um"] = False
+
+    if coords_are_pixels:
+        dense_radius = float(radius_dense_um) / float(microns_per_pixel)
+        prox_radius = float(caf_to_tumour_um) / float(microns_per_pixel)
+    else:
+        dense_radius = float(radius_dense_um)
+        prox_radius = float(caf_to_tumour_um)
+
+    qc_rows = []
+
+    for core, sub_idx in df.groupby("CORE_KEY").groups.items():
+        sub = df.loc[sub_idx].copy()
+
+        tumour_mask = sub["Is_Tumour_Main"].fillna(False).to_numpy()
+        tumour_sub = sub.loc[tumour_mask].copy()
+
+        n_total = int(sub.shape[0])
+        n_tumour = int(tumour_sub.shape[0])
+        n_caf = int(sub["CAF_Subtype"].notna().sum()) if "CAF_Subtype" in sub.columns else 0
+        n_immune = int(sub["Immune_Main_From_Detailed"].notna().sum())
+
+        if n_tumour == 0:
+            qc_rows.append({
+                "CORE_KEY": core,
+                "n_cells": n_total,
+                "n_tumour_main": 0,
+                "n_dense_tumour_50um": 0,
+                "n_caf_cells": n_caf,
+                "n_caf_prox_30um": 0,
+                "n_immune_cells": n_immune,
+            })
+            continue
+
+        tumour_coords = tumour_sub[["X", "Y"]].to_numpy(dtype=float)
+        tumour_tree = cKDTree(tumour_coords)
+
+        neigh_lists = tumour_tree.query_ball_point(tumour_coords, r=dense_radius)
+        n_other = np.array([max(len(v) - 1, 0) for v in neigh_lists], dtype=int)
+        dense_mask_local = n_other >= int(min_other_tumour_neighbours)
+
+        dense_tumour_idx = tumour_sub.index[dense_mask_local]
+        df.loc[dense_tumour_idx, "Is_Dense_Tumour_50um"] = True
+
+        n_dense = int(len(dense_tumour_idx))
+
+        if n_dense == 0:
+            qc_rows.append({
+                "CORE_KEY": core,
+                "n_cells": n_total,
+                "n_tumour_main": n_tumour,
+                "n_dense_tumour_50um": 0,
+                "n_caf_cells": n_caf,
+                "n_caf_prox_30um": 0,
+                "n_immune_cells": n_immune,
+            })
+            continue
+
+        dense_coords = df.loc[dense_tumour_idx, ["X", "Y"]].to_numpy(dtype=float)
+        dense_tree = cKDTree(dense_coords)
+
+        sub_coords = sub[["X", "Y"]].to_numpy(dtype=float)
+        dists, _ = dense_tree.query(sub_coords, k=1)
+
+        if coords_are_pixels:
+            dists_um = dists * float(microns_per_pixel)
+        else:
+            dists_um = dists
+
+        df.loc[sub.index, "Dist_to_Dense_Tumour_um"] = dists_um
+
+        caf_like = sub["CAF_Subtype"].notna()
+        caf_prox_mask = caf_like & (dists <= prox_radius)
+        df.loc[sub.index[caf_prox_mask], "CAF_Proximal_30um"] = True
+
+        qc_rows.append({
+            "CORE_KEY": core,
+            "n_cells": n_total,
+            "n_tumour_main": n_tumour,
+            "n_dense_tumour_50um": n_dense,
+            "n_caf_cells": n_caf,
+            "n_caf_prox_30um": int(caf_prox_mask.sum()),
+            "n_immune_cells": n_immune,
+        })
+
+    df.drop(columns=["_Main_Norm"], inplace=True, errors="ignore")
+    qc_df = pd.DataFrame(qc_rows).sort_values(
+        ["n_dense_tumour_50um", "n_caf_prox_30um", "n_cells"],
+        ascending=False
+    )
+
+    return df, qc_df
+
+
+# -------------------- CORE MATRIX BUILDER --------------------
+
+def compute_core_caf_target_matrices(
+    df: pd.DataFrame,
+    row_col: str,
+    target_col: str,
+    row_labels,
+    target_labels,
+    radius_um: float,
+    k_nn: int,
+    microns_per_pixel: float,
+    coords_are_pixels: bool,
+):
+    row_to_idx = {x: i for i, x in enumerate(row_labels)}
+    col_to_idx = {x: j for j, x in enumerate(target_labels)}
+
+    R = len(row_labels)
+    C = len(target_labels)
+
+    if coords_are_pixels:
+        if microns_per_pixel <= 0:
+            raise ValueError("microns_per_pixel must be > 0 when coords_are_pixels=True.")
+        radius_thresh = float(radius_um) / float(microns_per_pixel)
+    else:
+        radius_thresh = float(radius_um)
+
+    core_mats_raw = {}
+    core_mats_global = {}
+    core_mats_row = {}
+    core_qc_rows = []
+
+    for core, sub in df.groupby("CORE_KEY"):
+        sub = sub.dropna(subset=["X", "Y"]).reset_index(drop=True)
+        n = len(sub)
+        if n < 2:
+            continue
+
+        coords = sub[["X", "Y"]].to_numpy(dtype=float)
+        row_arr = sub[row_col].to_numpy(object)
+        col_arr = sub[target_col].to_numpy(object)
+
+        tree = cKDTree(coords)
+        k_query = min(int(k_nn) + 1, n)
+        if k_query <= 1:
+            continue
+
+        dists, nbrs = tree.query(coords, k=k_query)
+
+        i_idx = np.repeat(np.arange(n), k_query - 1)
+        j_idx = nbrs[:, 1:].reshape(-1)
+        d_flat = dists[:, 1:].reshape(-1)
+
+        keep = d_flat <= radius_thresh
+        i_idx = i_idx[keep]
+        j_idx = j_idx[keep]
+
+        if i_idx.size == 0:
+            mat_raw = pd.DataFrame(0.0, index=row_labels, columns=target_labels)
+            core_mats_raw[core] = mat_raw
+            core_mats_global[core] = normalize_matrix_global(mat_raw)
+            core_mats_row[core] = normalize_matrix_rowwise(mat_raw)
+            core_qc_rows.append({
+                "CORE_KEY": core,
+                "n_cells": int(n),
+                "n_unique_edges": 0,
+                "n_target_edges": 0,
+                "total_matrix_sum": 0.0,
+            })
+            continue
+
+        a = np.minimum(i_idx, j_idx)
+        b = np.maximum(i_idx, j_idx)
+        edges = np.unique(np.stack([a, b], axis=1), axis=0)
+
+        ia = edges[:, 0]
+        ib = edges[:, 1]
+
+        row_a = row_arr[ia]
+        row_b = row_arr[ib]
+        col_a = col_arr[ia]
+        col_b = col_arr[ib]
+
+        mask_ab = (~pd.isna(row_a)) & (~pd.isna(col_b))
+        mask_ba = (~pd.isna(row_b)) & (~pd.isna(col_a))
+
+        mat_np = np.zeros((R, C), dtype=float)
+        n_target_edges = 0
+
+        if np.any(mask_ab):
+            r = np.array([row_to_idx[x] for x in row_a[mask_ab]], dtype=int)
+            c = np.array([col_to_idx[x] for x in col_b[mask_ab]], dtype=int)
+            np.add.at(mat_np, (r, c), 1.0)
+            n_target_edges += len(r)
+
+        if np.any(mask_ba):
+            r = np.array([row_to_idx[x] for x in row_b[mask_ba]], dtype=int)
+            c = np.array([col_to_idx[x] for x in col_a[mask_ba]], dtype=int)
+            np.add.at(mat_np, (r, c), 1.0)
+            n_target_edges += len(r)
+
+        mat_raw = pd.DataFrame(mat_np, index=row_labels, columns=target_labels)
+        mat_global = normalize_matrix_global(mat_raw)
+        mat_row = normalize_matrix_rowwise(mat_raw)
+
+        core_mats_raw[core] = mat_raw
+        core_mats_global[core] = mat_global
+        core_mats_row[core] = mat_row
+
+        core_qc_rows.append({
+            "CORE_KEY": core,
+            "n_cells": int(n),
+            "n_unique_edges": int(len(edges)),
+            "n_target_edges": int(n_target_edges),
+            "total_matrix_sum": float(np.nansum(mat_raw.values)),
+        })
+
+    core_qc = pd.DataFrame(core_qc_rows)
+    return core_mats_raw, core_mats_global, core_mats_row, core_qc
+
+
+# -------------------- HEATMAPS --------------------
+
+def _pretty_caf_label(lab: str) -> str:
+    mapping = {
+        "Triple negative": "Triple\nnegative",
+        "Triple positive": "Triple\npositive",
+    }
+    return mapping.get(str(lab), str(lab))
+
+
+def plot_rect_heatmap(mat, title, path, label, vmin=0.0, vmax=None):
+    mat_plot = mat.copy()
+    mat_plot.index = [_pretty_caf_label(x) for x in mat_plot.index]
+    mat_plot.columns = [str(x) for x in mat_plot.columns]
+
+    n_rows, n_cols = mat_plot.shape
+    fig_w = max(10, 0.85 * n_cols + 4)
+    fig_h = max(6.5, 1.6 * n_rows + 2)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    sns.heatmap(
+        mat_plot,
+        cmap="viridis",
+        square=False,
+        vmin=vmin,
+        vmax=vmax,
+        cbar_kws={"label": label},
+        ax=ax
+    )
+
+    ax.set_title(title, pad=14, fontsize=16)
+    ax.set_xlabel(mat.columns.name if mat.columns.name else "", fontsize=14)
+    ax.set_ylabel(mat.index.name if mat.index.name else "", fontsize=14)
+
+    ax.set_xticklabels(
+        ax.get_xticklabels(),
+        rotation=90,
+        ha="center",
+        va="top",
+        fontsize=11
+    )
+    ax.set_yticklabels(
+        ax.get_yticklabels(),
+        rotation=0,
+        ha="right",
+        va="center",
+        fontsize=13
+    )
+
+    ax.tick_params(axis="y", pad=12)
+    ax.tick_params(axis="x", pad=6)
+
+    fig.subplots_adjust(left=0.28, bottom=0.22, right=0.96, top=0.90)
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+# -------------------- CIRCULAR INTERACTION MAPS --------------------
+
+def _pol2cart(theta_deg, r):
+    theta = np.deg2rad(theta_deg)
+    return np.array([r * np.cos(theta), r * np.sin(theta)])
+
+
+def _pretty_label(lab: str) -> str:
+    mapping = {
+        "Triple negative": "Triple\nnegative",
+        "Triple positive": "Triple\npositive",
+        "Other Immune": "Other\nImmune",
+        "B Cell FDR+": "B Cell\nFDR+",
+        "CD4 Conventional": "CD4\nConventional",
+        "CD8 Bystander": "CD8\nBystander",
+        "CD8 Cytotoxic": "CD8\nCytotoxic",
+        "CD8 Exhausted": "CD8\nExhausted",
+    }
+    return mapping.get(str(lab), str(lab))
+
+
+def build_fixed_chord_layout(row_labels, col_labels, within_gap_deg=3.0, block_gap_deg=12.0):
+    row_labels = list(row_labels)
+    col_labels = list(col_labels)
+    node_order = row_labels + col_labels
+
+    n = len(node_order)
+    total_gap = (max(len(row_labels) - 1, 0) * within_gap_deg) + \
+                (max(len(col_labels) - 1, 0) * within_gap_deg) + \
+                (2 * block_gap_deg)
+
+    usable = 360.0 - total_gap
+    span = usable / n
+
+    sectors = {}
+    angle = 90.0
+
+    for i, lab in enumerate(row_labels):
+        theta1 = angle
+        theta2 = angle + span
+        mid = 0.5 * (theta1 + theta2)
+        sectors[lab] = {"theta1": theta1, "theta2": theta2, "mid": mid}
+        angle = theta2 + (within_gap_deg if i < len(row_labels) - 1 else block_gap_deg)
+
+    for i, lab in enumerate(col_labels):
+        theta1 = angle
+        theta2 = angle + span
+        mid = 0.5 * (theta1 + theta2)
+        sectors[lab] = {"theta1": theta1, "theta2": theta2, "mid": mid}
+        angle = theta2 + (within_gap_deg if i < len(col_labels) - 1 else block_gap_deg)
+
+    return node_order, sectors
+
+
+def _label_rotation(angle_deg):
+    rot = angle_deg - 90.0
+    if rot < -90.0:
+        rot += 180.0
+    if rot > 90.0:
+        rot -= 180.0
+    return rot
+
+
+def _node_colour_map(row_labels, col_labels, immune_main_lookup):
+    caf_colours = {
+        "Subtype A": "#ff7f00",
+        "Subtype B": "#f28e2b",
+        "Subtype C": "#f6b04f",
+        "Triple negative": "#d95f02",
+        "Triple positive": "#ff9f1a",
+    }
+
+    immune_colours = {
+        "CD4": "#a6cee3",
+        "CD8": "#1f78b4",
+        "B Cell": "#a6d57a",
+        "Macrophage": "#33a02c",
+        "APC": "#e31a1c",
+        "Other Immune": "#f29595",
+    }
+
+    out = {}
+    for r in row_labels:
+        out[r] = caf_colours.get(r, "#ff7f00")
+
+    for c in col_labels:
+        grp = immune_main_lookup.get(c, c)
+        out[c] = immune_colours.get(grp, "#cccccc")
+
+    return out
+
+
+def plot_circular_interaction_map(
+    mat: pd.DataFrame,
+    title: str,
+    path: Path,
+    sectors: dict,
+    node_colour_map: dict,
+    row_labels,
+    col_labels,
+    width_scale_ref: float,
+    chord_min_frac: float = 0.05,
+):
+    mat = mat.fillna(0.0).copy()
+
+    fig, ax = plt.subplots(figsize=(13, 13))
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    outer_r = 1.06
+    ring_w = 0.12
+    chord_r = 0.84
+    label_r = 1.24
+
+    for lab, spec in sectors.items():
+        theta1 = spec["theta1"]
+        theta2 = spec["theta2"]
+        mid = spec["mid"]
+
+        wedge = Wedge(
+            center=(0, 0),
+            r=outer_r,
+            theta1=theta1,
+            theta2=theta2,
+            width=ring_w,
+            facecolor=node_colour_map.get(lab, "#cccccc"),
+            edgecolor="white",
+            linewidth=3,
+        )
+        ax.add_patch(wedge)
+
+        xy = _pol2cart(mid, label_r)
+        rot = _label_rotation(mid)
+
+        ax.text(
+            xy[0], xy[1], _pretty_label(lab),
+            rotation=rot,
+            rotation_mode="anchor",
+            ha="center",
+            va="center",
+            fontsize=11,
+        )
+
+    min_edge = chord_min_frac * width_scale_ref if width_scale_ref > 0 else 0.0
+
+    edges_to_plot = []
+    for r in row_labels:
+        for c in col_labels:
+            w = float(mat.at[r, c]) if (r in mat.index and c in mat.columns) else 0.0
+            if w > 0 and w >= min_edge:
+                edges_to_plot.append((r, c, w))
+
+    edges_to_plot.sort(key=lambda x: x[2])
+
+    for r, c, w in edges_to_plot:
+        a1 = sectors[r]["mid"]
+        a2 = sectors[c]["mid"]
+
+        p0 = _pol2cart(a1, chord_r)
+        p3 = _pol2cart(a2, chord_r)
+        c1 = _pol2cart(a1, 0.18)
+        c2 = _pol2cart(a2, 0.18)
+
+        verts = [tuple(p0), tuple(c1), tuple(c2), tuple(p3)]
+        codes = [MplPath.MOVETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4]
+        path_obj = MplPath(verts, codes)
+
+        lw = np.clip((w / width_scale_ref) * 10.0, 0.6, 10.0) if width_scale_ref > 0 else 1.0
+
+        patch = PathPatch(
+            path_obj,
+            facecolor="none",
+            edgecolor=node_colour_map.get(r, "#888888"),
+            lw=lw,
+            alpha=0.42,
+            capstyle="round",
+            joinstyle="round",
+        )
+        ax.add_patch(patch)
+
+    ax.set_xlim(-1.38, 1.38)
+    ax.set_ylim(-1.38, 1.38)
+    plt.title(title, pad=22)
+    plt.tight_layout()
+    plt.savefig(path, dpi=300)
+    plt.close()
+
+
+# -------------------- STATS --------------------
+
+def run_survival_stats_for_measure(
+    strat_for_stats: dict,
+    row_labels,
+    target_labels,
+    analysis_name: str,
+    row_col: str,
+    stats_name: str,
+    outdir: Path,
+    min_patients_per_group: int = 2,
+    pairwise_alpha_fdr: float = 0.05,
+):
+    cats = ["Short", "Intermediate", "Long"]
+
+    rows = []
+    data_lookup = {}
+
+    for caf in row_labels:
+        for tgt in target_labels:
+            data = {}
+            ns = {}
+            meds = {}
+
+            for cat in cats:
+                vals = [
+                    float(m.at[caf, tgt])
+                    for m in strat_for_stats[cat]
+                    if (caf in m.index and tgt in m.columns)
+                ]
+                data[cat] = vals
+                ns[cat] = len(vals)
+                meds[cat] = float(np.median(vals)) if len(vals) else np.nan
+
+            row = {
+                "CAF_Phenotype": caf,
+                "Target_Label": tgt,
+                "Analysis": analysis_name,
+                "RowColUsed": row_col,
+                "StatsOn": stats_name,
+                "n_Short": ns["Short"],
+                "n_Intermediate": ns["Intermediate"],
+                "n_Long": ns["Long"],
+                "median_Short": meds["Short"],
+                "median_Intermediate": meds["Intermediate"],
+                "median_Long": meds["Long"],
+            }
+
+            if all(ns[c] >= min_patients_per_group for c in cats):
+                H, p = kruskal(data["Short"], data["Intermediate"], data["Long"])
+                n_total = int(ns["Short"] + ns["Intermediate"] + ns["Long"])
+                row["KW_H"] = float(H)
+                row["KW_p"] = float(p)
+                row["KW_eps2"] = float(epsilon_squared_kw(float(H), len(cats), n_total))
+            else:
+                row["KW_H"] = np.nan
+                row["KW_p"] = np.nan
+                row["KW_eps2"] = np.nan
+
+            rows.append(row)
+            data_lookup[(caf, tgt)] = data
+
+    df_stats = pd.DataFrame(rows)
+
+    stats_path = outdir / f"Interaction_Survival_Stats_{stats_name}.csv"
+    sig_path = outdir / f"Significant_Interaction_Survival_Stats_{stats_name}.csv"
+
+    if df_stats.empty:
+        df_stats.to_csv(stats_path, index=False)
+        pd.DataFrame().to_csv(sig_path, index=False)
+        return df_stats
+
+    df_stats["KW_p_FDR"] = np.nan
+    kw_mask = df_stats["KW_p"].notna()
+    if kw_mask.any():
+        df_stats.loc[kw_mask, "KW_p_FDR"] = multipletests(
+            df_stats.loc[kw_mask, "KW_p"].values,
+            method="fdr_bh"
+        )[1]
+
+    pair_defs = [
+        ("Short", "Intermediate", "MWU_Short_vs_Intermediate"),
+        ("Short", "Long", "MWU_Short_vs_Long"),
+        ("Intermediate", "Long", "MWU_Intermediate_vs_Long"),
+    ]
+
+    for _, _, prefix in pair_defs:
+        df_stats[f"{prefix}_U"] = np.nan
+        df_stats[f"{prefix}_p"] = np.nan
+        df_stats[f"{prefix}_p_FDR"] = np.nan
+
+    sig_kw_mask = df_stats["KW_p_FDR"].notna() & (df_stats["KW_p_FDR"] < pairwise_alpha_fdr)
+
+    for idx in df_stats.index[sig_kw_mask]:
+        caf = df_stats.at[idx, "CAF_Phenotype"]
+        tgt = df_stats.at[idx, "Target_Label"]
+        data = data_lookup[(caf, tgt)]
+
+        for g1, g2, prefix in pair_defs:
+            x = data[g1]
+            y = data[g2]
+            if len(x) >= 1 and len(y) >= 1:
+                try:
+                    U, p = mannwhitneyu(x, y, alternative="two-sided", method="auto")
+                    df_stats.at[idx, f"{prefix}_U"] = float(U)
+                    df_stats.at[idx, f"{prefix}_p"] = float(p)
+                except Exception:
+                    pass
+
+    for _, _, prefix in pair_defs:
+        mask = df_stats[f"{prefix}_p"].notna()
+        if mask.any():
+            df_stats.loc[mask, f"{prefix}_p_FDR"] = multipletests(
+                df_stats.loc[mask, f"{prefix}_p"].values,
+                method="fdr_bh"
+            )[1]
+
+    df_stats = df_stats.sort_values(["KW_p_FDR", "KW_p"], na_position="last")
+    df_stats.to_csv(stats_path, index=False)
+
+    sig_any = (
+        (df_stats["KW_p_FDR"].notna() & (df_stats["KW_p_FDR"] < pairwise_alpha_fdr)) |
+        (df_stats["MWU_Short_vs_Intermediate_p_FDR"].notna() & (df_stats["MWU_Short_vs_Intermediate_p_FDR"] < pairwise_alpha_fdr)) |
+        (df_stats["MWU_Short_vs_Long_p_FDR"].notna() & (df_stats["MWU_Short_vs_Long_p_FDR"] < pairwise_alpha_fdr)) |
+        (df_stats["MWU_Intermediate_vs_Long_p_FDR"].notna() & (df_stats["MWU_Intermediate_vs_Long_p_FDR"] < pairwise_alpha_fdr))
+    )
+    df_stats.loc[sig_any].to_csv(sig_path, index=False)
+
+    return df_stats
+
+
+# -------------------- ANALYSIS DRIVER --------------------
+
+def run_caf_target_analysis(
+    df: pd.DataFrame,
+    clinical_df: pd.DataFrame,
+    outdir,
+    analysis_name: str,
+    row_col: str,
+    target_col: str,
+    row_labels,
+    target_labels,
+    target_axis_name: str,
+    row_axis_name: str = "CAF subtype",
+    radius_um: float = 50,
+    k_nn: int = 15,
+    microns_per_pixel: float = 0.325002431869506,
+    coords_are_pixels: bool = True,
+    min_patients_per_group: int = 2,
+    pairwise_alpha_fdr: float = 0.05,
+):
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+
+    row_labels = [x for x in row_labels if x in set(df[row_col].dropna().unique())]
+    target_labels = [x for x in target_labels if x in set(df[target_col].dropna().unique())]
+
+    if len(row_labels) == 0:
+        print(f"[WARN] No row labels found for {analysis_name}")
+        return
+
+    if len(target_labels) == 0:
+        print(f"[WARN] No target labels found for {analysis_name}")
+        return
+
+    core_mats_raw, core_mats_global, core_mats_row, core_qc = compute_core_caf_target_matrices(
+        df=df,
+        row_col=row_col,
+        target_col=target_col,
+        row_labels=row_labels,
+        target_labels=target_labels,
+        radius_um=radius_um,
+        k_nn=k_nn,
+        microns_per_pixel=microns_per_pixel,
+        coords_are_pixels=coords_are_pixels,
+    )
+
+    if len(core_mats_raw) == 0:
+        print(f"[WARN] No core matrices computed for {analysis_name}")
+        return
+
+    core_qc = core_qc.sort_values(["n_cells", "n_target_edges"], ascending=False)
+    core_qc.to_csv(outdir / "Core_QC.csv", index=False)
+
+    totals_raw = {core: float(np.nansum(m.values)) for core, m in core_mats_raw.items()}
+    median_total = float(np.median(list(totals_raw.values())))
+    rep_core = min(totals_raw, key=lambda c: abs(totals_raw[c] - median_total))
+
+    core2pt = df.groupby("CORE_KEY")["Spot Id 1"].first().to_dict()
+
+    pt_cores = {}
+    for core in core_mats_raw.keys():
+        pt = core2pt.get(core)
+        if pd.notna(pt):
+            pt_cores.setdefault(pt, []).append(core)
+
+    pt_raw = {}
+    pt_global = {}
+    pt_row = {}
+    for pt, cores in pt_cores.items():
+        pt_raw[pt] = median_mats([core_mats_raw[c] for c in cores])
+        pt_global[pt] = median_mats([core_mats_global[c] for c in cores])
+        pt_row[pt] = median_mats([core_mats_row[c] for c in cores])
+
+    pt_qc = pd.DataFrame(
+        [{"Spot Id 1": pt, "n_cores": len(cores)} for pt, cores in pt_cores.items()]
+    ).sort_values("n_cores", ascending=False)
+    pt_qc.to_csv(outdir / "Patient_QC.csv", index=False)
+
+    pt2surv = clinical_df.set_index("Spot Id 1")["SurvivalCategory"].to_dict()
+    cats = ["Short", "Intermediate", "Long"]
+
+    strat_raw = {c: [] for c in cats}
+    strat_global = {c: [] for c in cats}
+    strat_row = {c: [] for c in cats}
+
+    for pt in pt_raw.keys():
+        cat = pt2surv.get(pt)
+        if pd.isna(cat):
+            continue
+        cat = str(cat)
+        if cat in strat_raw:
+            strat_raw[cat].append(pt_raw[pt])
+            strat_global[cat].append(pt_global[pt])
+            strat_row[cat].append(pt_row[pt])
+
+    def _avg_or_zero(mats):
+        if mats:
+            return sum(mats) / len(mats)
+        return pd.DataFrame(0.0, index=row_labels, columns=target_labels)
+
+    strat_avg_raw = {cat: _avg_or_zero(mats) for cat, mats in strat_raw.items()}
+    strat_avg_global = {cat: _avg_or_zero(mats) for cat, mats in strat_global.items()}
+    strat_avg_row = {cat: _avg_or_zero(mats) for cat, mats in strat_row.items()}
+
+    for cat in cats:
+        for d in (strat_avg_raw, strat_avg_global, strat_avg_row):
+            d[cat].index.name = row_axis_name
+            d[cat].columns.name = target_axis_name
+
+    raw_vmax = max(float(np.nanmax(m.values)) for m in strat_avg_raw.values()) if strat_avg_raw else 0.0
+    global_vmax = max(float(np.nanmax(m.values)) for m in strat_avg_global.values()) if strat_avg_global else 0.0
+    row_vmax = max(float(np.nanmax(m.values)) for m in strat_avg_row.values()) if strat_avg_row else 0.0
+
+    for cat in cats:
+        plot_rect_heatmap(
+            strat_avg_raw[cat],
+            f"{analysis_name} Heatmap (RAW) — {cat}",
+            outdir / f"Heatmap_RAW_{cat}.png",
+            label="Contact count",
+            vmin=0.0,
+            vmax=raw_vmax,
+        )
+        plot_rect_heatmap(
+            strat_avg_global[cat],
+            f"{analysis_name} Heatmap (GLOBAL_NORM) — {cat}",
+            outdir / f"Heatmap_GLOBAL_NORM_{cat}.png",
+            label="Proportion of all matrix interactions",
+            vmin=0.0,
+            vmax=global_vmax,
+        )
+        plot_rect_heatmap(
+            strat_avg_row[cat],
+            f"{analysis_name} Heatmap (ROW_NORM) — {cat}",
+            outdir / f"Heatmap_ROW_NORM_{cat}.png",
+            label="Proportion within CAF row",
+            vmin=0.0,
+            vmax=row_vmax,
+        )
+
+        strat_avg_raw[cat].to_csv(outdir / f"Matrix_RAW_{cat}.csv")
+        strat_avg_global[cat].to_csv(outdir / f"Matrix_GLOBAL_NORM_{cat}.csv")
+        strat_avg_row[cat].to_csv(outdir / f"Matrix_ROW_NORM_{cat}.csv")
+
+    def _edge_scale_ref(strat_dict):
+        vals_all = []
+        for cat in cats:
+            vals = strat_dict[cat].values.ravel()
+            vals = vals[np.isfinite(vals) & (vals > 0)]
+            vals_all.extend(vals.tolist())
+        if len(vals_all) == 0:
+            return 1.0
+        ref = float(np.quantile(vals_all, 0.90))
+        if ref <= 0:
+            ref = float(np.max(vals_all))
+        return ref if ref > 0 else 1.0
+
+    global_edge_ref = _edge_scale_ref(strat_avg_global)
+    row_edge_ref = _edge_scale_ref(strat_avg_row)
+
+    if target_col == "Immune_Main_From_Detailed":
+        immune_main_lookup = {x: x for x in target_labels}
+    elif target_col == "Immune_Final_Label":
+        lookup_rows = df.loc[df[target_col].notna(), [target_col, "Immune_Final_Main"]].drop_duplicates()
+        immune_main_lookup = lookup_rows.set_index(target_col)["Immune_Final_Main"].to_dict()
+    else:
+        immune_main_lookup = {x: x for x in target_labels}
+
+    _, sectors = build_fixed_chord_layout(row_labels, target_labels)
+    node_colour_map = _node_colour_map(row_labels, target_labels, immune_main_lookup)
+
+    for cat in cats:
+        plot_circular_interaction_map(
+            strat_avg_global[cat],
+            f"{analysis_name} Circular Interaction Map (GLOBAL_NORM) — {cat}",
+            outdir / f"Network_GLOBAL_NORM_{cat}.png",
+            sectors=sectors,
+            node_colour_map=node_colour_map,
+            row_labels=row_labels,
+            col_labels=target_labels,
+            width_scale_ref=global_edge_ref,
+            chord_min_frac=0.05,
+        )
+        plot_circular_interaction_map(
+            strat_avg_row[cat],
+            f"{analysis_name} Circular Interaction Map (ROW_NORM) — {cat}",
+            outdir / f"Network_ROW_NORM_{cat}.png",
+            sectors=sectors,
+            node_colour_map=node_colour_map,
+            row_labels=row_labels,
+            col_labels=target_labels,
+            width_scale_ref=row_edge_ref,
+            chord_min_frac=0.05,
+        )
+
+    rep_raw = core_mats_raw[rep_core]
+    rep_global = core_mats_global[rep_core]
+    rep_row = core_mats_row[rep_core]
+
+    for m in (rep_raw, rep_global, rep_row):
+        m.index.name = row_axis_name
+        m.columns.name = target_axis_name
+
+    plot_rect_heatmap(
+        rep_raw,
+        f"Representative {analysis_name} Heatmap (RAW) — Core {rep_core}",
+        outdir / f"Representative_Heatmap_RAW_{rep_core}.png",
+        label="Contact count",
+        vmin=0.0,
+        vmax=raw_vmax,
+    )
+    plot_rect_heatmap(
+        rep_global,
+        f"Representative {analysis_name} Heatmap (GLOBAL_NORM) — Core {rep_core}",
+        outdir / f"Representative_Heatmap_GLOBAL_NORM_{rep_core}.png",
+        label="Proportion of all matrix interactions",
+        vmin=0.0,
+        vmax=global_vmax,
+    )
+    plot_rect_heatmap(
+        rep_row,
+        f"Representative {analysis_name} Heatmap (ROW_NORM) — Core {rep_core}",
+        outdir / f"Representative_Heatmap_ROW_NORM_{rep_core}.png",
+        label="Proportion within CAF row",
+        vmin=0.0,
+        vmax=row_vmax,
+    )
+
+    plot_circular_interaction_map(
+        rep_global,
+        f"Representative {analysis_name} Circular Interaction Map (GLOBAL_NORM) — Core {rep_core}",
+        outdir / f"Representative_Network_GLOBAL_NORM_{rep_core}.png",
+        sectors=sectors,
+        node_colour_map=node_colour_map,
+        row_labels=row_labels,
+        col_labels=target_labels,
+        width_scale_ref=global_edge_ref,
+        chord_min_frac=0.05,
+    )
+    plot_circular_interaction_map(
+        rep_row,
+        f"Representative {analysis_name} Circular Interaction Map (ROW_NORM) — Core {rep_core}",
+        outdir / f"Representative_Network_ROW_NORM_{rep_core}.png",
+        sectors=sectors,
+        node_colour_map=node_colour_map,
+        row_labels=row_labels,
+        col_labels=target_labels,
+        width_scale_ref=row_edge_ref,
+        chord_min_frac=0.05,
+    )
+
+    rep_raw.to_csv(outdir / f"Representative_Matrix_RAW_{rep_core}.csv")
+    rep_global.to_csv(outdir / f"Representative_Matrix_GLOBAL_NORM_{rep_core}.csv")
+    rep_row.to_csv(outdir / f"Representative_Matrix_ROW_NORM_{rep_core}.csv")
+
+    # Separate stats for each measure
+    df_stats_raw = run_survival_stats_for_measure(
+        strat_for_stats=strat_raw,
+        row_labels=row_labels,
+        target_labels=target_labels,
+        analysis_name=analysis_name,
+        row_col=row_col,
+        stats_name="RAW",
+        outdir=outdir,
+        min_patients_per_group=min_patients_per_group,
+        pairwise_alpha_fdr=pairwise_alpha_fdr,
+    )
+
+    df_stats_global = run_survival_stats_for_measure(
+        strat_for_stats=strat_global,
+        row_labels=row_labels,
+        target_labels=target_labels,
+        analysis_name=analysis_name,
+        row_col=row_col,
+        stats_name="GLOBAL_NORM",
+        outdir=outdir,
+        min_patients_per_group=min_patients_per_group,
+        pairwise_alpha_fdr=pairwise_alpha_fdr,
+    )
+
+    df_stats_row = run_survival_stats_for_measure(
+        strat_for_stats=strat_row,
+        row_labels=row_labels,
+        target_labels=target_labels,
+        analysis_name=analysis_name,
+        row_col=row_col,
+        stats_name="ROW_NORM",
+        outdir=outdir,
+        min_patients_per_group=min_patients_per_group,
+        pairwise_alpha_fdr=pairwise_alpha_fdr,
+    )
+
+    summary = {
+        "analysis_name": analysis_name,
+        "row_col": row_col,
+        "target_col": target_col,
+        "radius_um": float(radius_um),
+        "k_nn": int(k_nn),
+        "coords_are_pixels": bool(coords_are_pixels),
+        "microns_per_pixel": float(microns_per_pixel) if coords_are_pixels else np.nan,
+        "n_cores_used": int(len(core_mats_raw)),
+        "n_patients_used": int(len(pt_raw)),
+        "patients_in_short": int(len(strat_row["Short"])),
+        "patients_in_intermediate": int(len(strat_row["Intermediate"])),
+        "patients_in_long": int(len(strat_row["Long"])),
+        "shared_raw_vmax": float(raw_vmax),
+        "shared_global_norm_vmax": float(global_vmax),
+        "shared_row_norm_vmax": float(row_vmax),
+        "shared_global_edge_width_ref": float(global_edge_ref),
+        "shared_row_edge_width_ref": float(row_edge_ref),
+        "representative_core": rep_core,
+        "pairwise_alpha_fdr": float(pairwise_alpha_fdr),
+        "patient_summary_method": "median_across_cores",
+        "stats_files": "RAW, GLOBAL_NORM, ROW_NORM",
+        "n_stats_rows_raw": int(df_stats_raw.shape[0]) if isinstance(df_stats_raw, pd.DataFrame) else 0,
+        "n_stats_rows_global_norm": int(df_stats_global.shape[0]) if isinstance(df_stats_global, pd.DataFrame) else 0,
+        "n_stats_rows_row_norm": int(df_stats_row.shape[0]) if isinstance(df_stats_row, pd.DataFrame) else 0,
+    }
+    pd.Series(summary).to_csv(outdir / "RUN_SUMMARY.csv")
+
+    pd.Series(row_labels, name="CAF_labels_used").to_csv(outdir / "CAF_labels_used.csv", index=False)
+    pd.Series(target_labels, name="Target_labels_used").to_csv(outdir / "Target_labels_used.csv", index=False)
+
+    print(f"[DONE] {analysis_name}")
+    print(f"       Outputs in: {outdir}")
+
+
+# -------------------- MASTER STAGE --------------------
+
+def stage10_caf_immune_full(
+    final_data: pd.DataFrame,
+    clinical_df: pd.DataFrame,
+    outdir,
+    final_col_candidates=("Final_Phenotype", "Final phenotype", "FinalPhenotype"),
+    detailed_col_candidates=("Detailed_Phenotype", "Detailed phenotype", "DetailedPhenotype"),
+    main_pheno_candidates=("Main phenotype", "Main_Phenotype", "Main_Cell_Type", "Main Cell Type", "MainCellType"),
+    radius_um: float = 50,
+    k_nn: int = 15,
+    microns_per_pixel: float = 0.325002431869506,
+    coords_are_pixels: bool = True,
+    min_patients_per_group: int = 2,
+    pairwise_alpha_fdr: float = 0.05,
+    tumour_dense_radius_um: float = 50.0,
+    min_other_tumour_neighbours: int = 5,
+    tumour_prox_um: float = 30.0,
+):
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+
+    final_col = find_column(final_data, final_col_candidates)
+    detailed_col = find_column(final_data, detailed_col_candidates)
+    main_col = find_column(final_data, main_pheno_candidates)
+
+    if final_col is None:
+        raise ValueError(f"Could not find final phenotype column. Tried: {list(final_col_candidates)}")
+    if detailed_col is None:
+        raise ValueError(f"Could not find detailed phenotype column. Tried: {list(detailed_col_candidates)}")
+    if main_col is None:
+        raise ValueError(f"Could not find main phenotype column. Tried: {list(main_pheno_candidates)}")
+
+    required_cols = {"Spot Id 1", "Spot Id 2", "X", "Y", final_col, detailed_col, main_col}
+    missing = required_cols - set(final_data.columns)
+    if missing:
+        raise ValueError(f"final_data missing required columns: {sorted(missing)}")
+
+    if "Spot Id 1" not in clinical_df.columns or "SurvivalCategory" not in clinical_df.columns:
+        raise ValueError("clinical_df must contain ['Spot Id 1', 'SurvivalCategory'].")
+
+    print(f"[INFO] Using final phenotype column: {final_col}")
+    print(f"[INFO] Using detailed phenotype column: {detailed_col}")
+    print(f"[INFO] Using main phenotype column: {main_col}")
+
+    df, caf_labels, immune_main_order, immune_final_order = prepare_analysis_columns(
+        final_data=final_data,
+        final_col=final_col,
+        detailed_col=detailed_col,
+    )
+
+    df, dense_qc = add_dense_tumour_proximity_flags(
+        df=df,
+        main_col=main_col,
+        radius_dense_um=tumour_dense_radius_um,
+        min_other_tumour_neighbours=min_other_tumour_neighbours,
+        caf_to_tumour_um=tumour_prox_um,
+        microns_per_pixel=microns_per_pixel,
+        coords_are_pixels=coords_are_pixels,
+    )
+    dense_qc.to_csv(outdir / "Dense_Tumour_Proximity_QC.csv", index=False)
+
+    df["CAF_Subtype_Prox"] = df["CAF_Subtype"].where(df["CAF_Proximal_30um"])
+
+    # 01: all CAFs x all immune main classes
+    run_caf_target_analysis(
+        df=df,
+        clinical_df=clinical_df,
+        outdir=outdir / "01_CAFxImmuneMainCellType",
+        analysis_name="CAF x Immune Main Class (all CAFs, all immune; from Detailed_Phenotype)",
+        row_col="CAF_Subtype",
+        target_col="Immune_Main_From_Detailed",
+        row_labels=caf_labels,
+        target_labels=immune_main_order,
+        target_axis_name="Immune class from Detailed_Phenotype",
+        row_axis_name="CAF subtype",
+        radius_um=radius_um,
+        k_nn=k_nn,
+        microns_per_pixel=microns_per_pixel,
+        coords_are_pixels=coords_are_pixels,
+        min_patients_per_group=min_patients_per_group,
+        pairwise_alpha_fdr=pairwise_alpha_fdr,
+    )
+
+    # 02: all CAFs x all immune final phenotypes
+    run_caf_target_analysis(
+        df=df,
+        clinical_df=clinical_df,
+        outdir=outdir / "02_CAFxImmuneFinalPhenotype",
+        analysis_name="CAF x Immune Final Phenotype (all CAFs, all immune)",
+        row_col="CAF_Subtype",
+        target_col="Immune_Final_Label",
+        row_labels=caf_labels,
+        target_labels=immune_final_order,
+        target_axis_name="Immune final phenotype",
+        row_axis_name="CAF subtype",
+        radius_um=radius_um,
+        k_nn=k_nn,
+        microns_per_pixel=microns_per_pixel,
+        coords_are_pixels=coords_are_pixels,
+        min_patients_per_group=min_patients_per_group,
+        pairwise_alpha_fdr=pairwise_alpha_fdr,
+    )
+
+    # 03: tumour-prox CAFs only x all immune main classes
+    run_caf_target_analysis(
+        df=df,
+        clinical_df=clinical_df,
+        outdir=outdir / "03_TumourProxCAFxImmuneMainCellType_30um",
+        analysis_name="Tumour-Proximal CAF (30um, dense tumour) x Immune Main Class",
+        row_col="CAF_Subtype_Prox",
+        target_col="Immune_Main_From_Detailed",
+        row_labels=caf_labels,
+        target_labels=immune_main_order,
+        target_axis_name="Immune class from Detailed_Phenotype",
+        row_axis_name="Tumour-prox CAF subtype",
+        radius_um=radius_um,
+        k_nn=k_nn,
+        microns_per_pixel=microns_per_pixel,
+        coords_are_pixels=coords_are_pixels,
+        min_patients_per_group=min_patients_per_group,
+        pairwise_alpha_fdr=pairwise_alpha_fdr,
+    )
+
+    # 04: tumour-prox CAFs only x all immune final phenotypes
+    run_caf_target_analysis(
+        df=df,
+        clinical_df=clinical_df,
+        outdir=outdir / "04_TumourProxCAFxImmuneFinalPhenotype_30um",
+        analysis_name="Tumour-Proximal CAF (30um, dense tumour) x Immune Final Phenotype",
+        row_col="CAF_Subtype_Prox",
+        target_col="Immune_Final_Label",
+        row_labels=caf_labels,
+        target_labels=immune_final_order,
+        target_axis_name="Immune final phenotype",
+        row_axis_name="Tumour-prox CAF subtype",
+        radius_um=radius_um,
+        k_nn=k_nn,
+        microns_per_pixel=microns_per_pixel,
+        coords_are_pixels=coords_are_pixels,
+        min_patients_per_group=min_patients_per_group,
+        pairwise_alpha_fdr=pairwise_alpha_fdr,
+    )
+
+    master_summary = {
+        "final_col_used": final_col,
+        "detailed_col_used": detailed_col,
+        "main_pheno_col_used": main_col,
+        "radius_um": float(radius_um),
+        "k_nn": int(k_nn),
+        "tumour_dense_radius_um": float(tumour_dense_radius_um),
+        "min_other_tumour_neighbours": int(min_other_tumour_neighbours),
+        "tumour_prox_um": float(tumour_prox_um),
+        "coords_are_pixels": bool(coords_are_pixels),
+        "microns_per_pixel": float(microns_per_pixel) if coords_are_pixels else np.nan,
+        "pairwise_alpha_fdr": float(pairwise_alpha_fdr),
+        "core_level": True,
+        "patient_summary_method": "median_across_cores",
+        "analysis_01_02_rows": "all_CAFs",
+        "analysis_03_04_rows": "tumour_prox_CAFs_only",
+        "analysis_01_04_targets": "all_immune_cells_for_respective_label_set",
+        "matrix_outputs": "RAW, GLOBAL_NORM, ROW_NORM",
+        "network_outputs": "GLOBAL_NORM, ROW_NORM",
+        "stats_outputs": "RAW, GLOBAL_NORM, ROW_NORM",
+    }
+    pd.Series(master_summary).to_csv(outdir / "MASTER_RUN_SUMMARY.csv")
+
+    print("[DONE] Full CAF–Immune analysis complete.")
+    print(f"Outputs in: {outdir}")
+
+
+# -------------------- MAIN --------------------
+
+def main():
+    final_csv = "/data/home/hfx986/Combat/Final_Cell_Phenotypes.csv"
+    clin_csv = "/data/home/hfx986/Clinical_Data.csv"
+
+    output_dir = "/data/home/hfx986/PhD/Stage10_CAF_Immune_Full/CAF_Immune_Full_50um_15NN_TumourProxCAF30um_AllStats"
+
+    radius_um = 50
+    k_nn = 15
+
+    final_data = pd.read_csv(final_csv)
+    clinical_df = preprocess_clinical(pd.read_csv(clin_csv))
+
+    stage10_caf_immune_full(
+        final_data=final_data,
+        clinical_df=clinical_df,
+        outdir=output_dir,
+        final_col_candidates=("Final_Phenotype", "Final phenotype", "FinalPhenotype"),
+        detailed_col_candidates=("Detailed_Phenotype", "Detailed phenotype", "DetailedPhenotype"),
+        main_pheno_candidates=("Main phenotype", "Main_Phenotype", "Main_Cell_Type", "Main Cell Type", "MainCellType"),
+        radius_um=radius_um,
+        k_nn=k_nn,
+        microns_per_pixel=0.325002431869506,
+        coords_are_pixels=True,
+        min_patients_per_group=2,
+        pairwise_alpha_fdr=0.05,
+        tumour_dense_radius_um=50.0,
+        min_other_tumour_neighbours=5,
+        tumour_prox_um=30.0,
+    )
+
+
+if __name__ == "__main__":
+    main()
