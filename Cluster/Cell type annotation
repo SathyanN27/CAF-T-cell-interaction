@@ -1,0 +1,1082 @@
+# =============================================================================
+# Spatial Proteomics: Main & Subclustering with ComBat, Scaling, Safe PCs,
+# =============================================================================
+import os
+import math
+import pandas as pd
+import numpy as np
+import scanpy as sc
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
+
+# -----------------------------
+# A. CONFIG & OUTPUT DIR
+# -----------------------------
+outdir = "/data/home/hfx986/Combat"
+os.makedirs(outdir, exist_ok=True)
+
+# Optional external mapping CSV (see Amendment #11)
+# If present, it overrides the hard-coded cluster_to_refined dict.
+MAINCLUSTER_MAP_CSV = "/data/home/hfx986/Combat/maincluster_refined_map.csv"
+
+# -----------------------------
+# B. UTILITIES (Amendments #2, #10)
+# -----------------------------
+def safe_npcs(adata, cap=20):
+    """
+    Return a safe number of PCs: <= n_vars and <= n_obs-1, at least 1, capped by 'cap'.
+    (Amendment #2)
+    """
+    return int(max(1, min(cap, adata.n_vars, adata.n_obs - 1)))
+
+# Consistent refined palette across figures (Amendment #12)
+REFINED_ORDER = ["Immune", "CAF", "Tumour", "Endothelial", "Other", "Undefined"]
+REFINED_COLORS = {
+    "Immune": "#66c2a5",
+    "CAF": "#fc8d62",
+    "Tumour": "#8da0cb",
+    "Endothelial": "#e78ac3",
+    "Other": "#a6d854",
+    "Undefined": "#808080"
+}
+
+# -----------------------------
+# C. LOAD DATA
+# -----------------------------
+intensity_file = '/data/home/hfx986/Intensity.csv'
+data = pd.read_csv(intensity_file)
+
+# Enforce string IDs early to avoid numeric truncation (Small tidy-up)
+for c in ["Spot Id 1", "Spot Id 2", "TMA Block Name"]:
+    if c in data.columns:
+        data[c] = data[c].astype(str)
+
+# Stable cell index
+data["CellID"] = data.index.astype(str)
+data.set_index("CellID", inplace=True)
+
+# -----------------------------
+# D. MARKERS
+# -----------------------------
+# All candidate markers from your file:
+all_markers_original = [
+    'CD20', 'CD45', 'CD4', 'CD8', 'CD31', 'CD21', 'CD68', 'ASMA',
+    'Vimentin', 'Periostin', 'MYH11', 'PDPN', 'EpCAM-PanCK',
+    'GRZB', 'CD107a', 'PD1', 'LAG3', 'MHCII', 'FOXP3', 'BCL-6',
+    'CAIX', 'Ki67', 'CD103', 'DAPI'
+]
+
+# Amendment #8: do NOT include DAPI in ComBat or clustering features
+all_markers = [m for m in all_markers_original if m != "DAPI"]
+
+# Feature sets for clustering (unchanged)
+markers_main = ['EpCAM-PanCK', 'CD31', 'CD45', 'ASMA', 'Vimentin', 'PDPN', 'MYH11', 'Periostin']
+
+# Subclustering markers
+sub_markers_tumour = ["CAIX"]
+sub_markers_immune = ["CD4", "CD8", "CD20", "CD68", "MHCII", "CD21"]
+sub_markers_caf    = ["PDPN", "MYH11", "Periostin", "MHCII"]
+
+# -----------------------------
+# E. PREPROCESSING (unchanged logic)
+# -----------------------------
+# Fill missing with 0 for bounds calc
+data[all_markers] = data[all_markers].fillna(0)
+
+lower_bounds = data[all_markers].quantile(0.01)
+upper_bounds = data[all_markers].quantile(0.99)
+
+data_excluded = data[all_markers].copy()
+for marker in all_markers:
+    mask = (data_excluded[marker] >= lower_bounds[marker]) & (data_excluded[marker] <= upper_bounds[marker])
+    data_excluded.loc[~mask, marker] = np.nan
+
+# Log1p on positive-shifted values to avoid log(0)
+data_excluded += 1e-6
+data_log = np.log1p(data_excluded)
+
+# Mean impute per marker
+imputer = SimpleImputer(strategy='mean')
+data_imputed = pd.DataFrame(imputer.fit_transform(data_log),
+                            index=data_log.index,
+                            columns=data_log.columns)
+
+# -----------------------------
+# F. ComBat batch correction
+# -----------------------------
+# Build AnnData with batch key = TMA Block Name
+batch = data["TMA Block Name"].astype(str).fillna("Unknown")  # robust batch
+adata_combat = sc.AnnData(
+    X=data_imputed[all_markers].values,
+    obs=pd.DataFrame({"TMA_Block_Name": batch.values}, index=data_imputed.index),
+    var=pd.DataFrame(index=all_markers)
+)
+sc.pp.combat(adata_combat, key='TMA_Block_Name')  # ComBat on chosen markers (no DAPI)
+
+combat_corrected = pd.DataFrame(
+    adata_combat.X, columns=all_markers, index=data_imputed.index
+)
+
+# Restore metadata
+normalized_data = combat_corrected.copy()
+for meta_col in ["Spot Id 1", "Spot Id 2", "X", "Y", "TMA Block Name"]:
+    normalized_data[meta_col] = data[meta_col]
+
+normalized_data["CellID"] = normalized_data.index
+
+# Ensure coordinates are numeric (for plotting/scatter stability)
+normalized_data["X"] = pd.to_numeric(normalized_data["X"], errors="coerce")
+normalized_data["Y"] = pd.to_numeric(normalized_data["Y"], errors="coerce")
+
+
+# -----------------------------
+# G. MAIN CLUSTERING (Amendments #1, #2)
+# -----------------------------
+resolution_main = 1.5
+# Create AnnData from features; scale before PCA (Amendment #1)
+adata_main = sc.AnnData(
+    normalized_data[markers_main].values,
+    obs=pd.DataFrame(index=normalized_data.index.astype(str)),
+    var=pd.DataFrame(index=markers_main)
+)
+sc.pp.scale(adata_main, zero_center=True, max_value=10)  # standardize per marker
+sc.tl.pca(adata_main, svd_solver='arpack')
+sc.pp.neighbors(adata_main, n_neighbors=15, n_pcs=safe_npcs(adata_main))  # safe PCs (Amendment #2)
+sc.tl.leiden(adata_main, resolution=resolution_main, flavor="igraph", n_iterations=2, directed=False)
+sc.tl.umap(adata_main)
+
+normalized_data["MainCluster"] = adata_main.obs['leiden'].astype("int32").values
+normalized_data["UMAP_main_1"] = adata_main.obsm['X_umap'][:, 0]
+normalized_data["UMAP_main_2"] = adata_main.obsm['X_umap'][:, 1]
+
+# -----------------------------
+# H. HEATMAP OF MAIN CLUSTERS (Amendment #9)
+# -----------------------------
+cluster_means = normalized_data.groupby('MainCluster')[markers_main].mean()
+# Z-score per marker; cap extremes for readability
+data_zscore = cluster_means.apply(lambda x: (x - x.mean()) / x.std(ddof=0), axis=0).clip(-2, 2)
+
+clusters_per_page = 15
+num_clusters = data_zscore.shape[0]
+num_pages = math.ceil(num_clusters / clusters_per_page)
+
+for page in range(num_pages):
+    start = page * clusters_per_page
+    end = min(start + clusters_per_page, num_clusters)
+    data_subset = data_zscore.iloc[start:end]
+
+    plt.figure(figsize=(16, max(10, 0.6 * (end - start))))
+    sns.heatmap(
+        data_subset,
+        cmap="RdBu_r",
+        annot=True,
+        fmt=".2f",
+        linewidths=0.5,
+        linecolor='gray',
+        center=0,
+        annot_kws={"size": 9},
+        cbar_kws={'label': 'Marker Expression Z-score (±2 cap)'}
+    )
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.xlabel("Markers", fontsize=12, fontweight='bold')
+    plt.ylabel("Main Cluster", fontsize=12, fontweight='bold')
+    plt.title(
+        f"Aggregated Marker Expression per Main Cluster (Z-score)\nClusters {start}–{end-1}",
+        fontsize=14, fontweight='bold'
+    )
+    plt.tight_layout()
+    paged_heatmap_path = os.path.join(outdir, f"Enhanced_Aggregated_Heatmap_Main_Clustering_clusters_{start}_to_{end-1}.png")
+    plt.savefig(paged_heatmap_path, dpi=300)
+    plt.close()
+    print(f"Saved heatmap page: {paged_heatmap_path}")
+
+# -----------------------------
+# I. UMAP of Main Clustering (Amendment #10 palette sizing)
+# -----------------------------
+umap_main_path = os.path.join(outdir, "UMAP_Main_Clustering.png")
+plt.figure(figsize=(12, 6))
+nclust = int(normalized_data["MainCluster"].nunique())
+# Pick a palette big enough for many clusters
+if nclust <= 10:
+    pal = sns.color_palette("tab10", nclust)
+else:
+    pal = sns.color_palette("tab20", min(20, nclust))
+
+ax = sns.scatterplot(
+    x='UMAP_main_1', y='UMAP_main_2',
+    hue='MainCluster', data=normalized_data,
+    palette=pal, s=10, legend='full'
+)
+plt.title("Main Clustering UMAP")
+plt.xlabel("UMAP1"); plt.ylabel("UMAP2")
+handles, labels = ax.get_legend_handles_labels()
+if labels and labels[0] == 'MainCluster':
+    handles, labels = handles[1:], labels[1:]
+ax.legend(handles=handles, labels=labels, title="MainCluster",
+          loc='center left', bbox_to_anchor=(1, 0.5), ncol=2)
+plt.tight_layout(rect=[0, 0, 0.75, 1])
+plt.savefig(umap_main_path, dpi=300)
+plt.close()
+print(f"Main clustering UMAP saved as: {umap_main_path}")
+
+# -----------------------------
+# J. CLUSTER SUMMARY CSV
+# -----------------------------
+cluster_counts = normalized_data['MainCluster'].value_counts().sort_index()
+total_cells = normalized_data.shape[0]
+cluster_percentages = (cluster_counts / total_cells) * 100
+cluster_summary = pd.DataFrame({
+    "MainCluster": cluster_counts.index,
+    "Cell Count": cluster_counts.values,
+    "Percentage": cluster_percentages.values
+})
+summary_csv_path = os.path.join(outdir, "MainCluster_Summary.csv")
+cluster_summary.to_csv(summary_csv_path, index=False)
+print("Cluster Summary:\n", cluster_summary)
+print(f"Cluster summary saved as: {summary_csv_path}")
+
+# -----------------------------
+# K. MAP MainCluster -> RefinedPhenotype (Amendment #11)
+# -----------------------------
+# Fallback mapping (your original, trimmed to show pattern; keep your full mapping)
+cluster_to_refined = {
+    '0': 'CAF', 
+    '1': 'Immune', 
+    '2': 'CAF', 
+    '3': 'CAF',
+    '4': 'Tumour', 
+    '5': 'Other', 
+    '6': 'CAF', 
+    '7': 'Immune',
+    '8': 'Immune', 
+    '9': 'Immune', 
+    '10': 'Immune',
+    '11': 'Immune',
+    '12': 'Immune',
+    '13': 'Tumour',
+    '14': 'Other',
+    '15': 'Immune',
+    '16': 'Immune',
+    '17': 'Immune',
+    '18': 'CAF',
+    '19': 'Tumour',
+    '20': 'CAF',
+    '21': 'Immune',
+    '22': 'Artefact',
+    '23': 'Other',
+    '24': 'Endothelial',
+    '25': 'CAF',
+    '26': 'CAF',
+    '27': 'CAF',
+    '28': 'Artefact',
+    '29': 'CAF',
+    '30': 'Artefact',
+    '31': 'CAF',
+    '32': 'CAF',
+    '33': 'Artefact',
+    '34': 'CAF',
+    '35': 'Artefact',
+    '36': 'CAF',
+    '37': 'Artefact',
+    '38': 'Artefact',
+    '39': 'Tumour',
+    '40': 'Immune',
+    '41': 'Artefact',
+    '42': 'Tumour',
+    '43': 'Artefact',
+    '44': 'Artefact',
+    '45': 'Artefact',
+    '46': 'Tumour',
+    '47': 'CAF',
+    '48': 'CAF',
+    '49': 'Immune',
+    '50': 'CAF',
+    '51': 'Artefact',
+    '52': 'Immune',
+    '53': 'Tumour',
+    '54': 'CAF',
+    '55': 'Tumour',
+    '56': 'Immune',
+    '57': 'CAF',
+    '58': 'Artefact',
+    '59': 'Immune',
+    '60': 'Artefact',
+    '61': 'Artefact',
+    '62': 'Artefact',
+    '63': 'Artefact',
+    '64': 'Immune',
+    '65': 'Artefact',
+    '66': 'Immune',
+    '67': 'Artefact',
+    '68': 'Artefact',
+    '69': 'Artefact',
+    '70': 'Artefact',
+    '71': 'Immune',
+    '72': 'Artefact',
+    '73': 'Artefact',
+    '74': 'Artefact',
+    '75': 'Artefact',
+    '76': 'Artefact',
+    '77': 'Artefact',
+    '78': 'Artefact',
+    '79': 'Artefact',
+    '80': 'Artefact',
+    '81': 'Artefact',
+    '82': 'Artefact',
+    '83': 'Artefact',
+    '84': 'Artefact',
+    '85': 'Artefact',
+    '86': 'Artefact',
+    '87': 'Artefact',
+    '88': 'Artefact',
+    '89': 'Artefact',
+    '90': 'Artefact',
+}
+
+# If CSV exists, use it to override mapping without editing code
+if os.path.exists(MAINCLUSTER_MAP_CSV):
+    map_df = pd.read_csv(MAINCLUSTER_MAP_CSV, dtype={"MainCluster": str, "RefinedPhenotype": str})
+    map_dict = dict(zip(map_df["MainCluster"], map_df["RefinedPhenotype"]))
+else:
+    map_dict = cluster_to_refined
+
+normalized_data["RefinedPhenotype"] = (
+    normalized_data["MainCluster"].astype(str).map(map_dict).fillna("Other")
+)
+
+# Save the full main-cluster assignments with refined phenotype
+output_csv_refined = os.path.join(outdir, "main_cluster_assignments_with_refined.csv")
+normalized_data.to_csv(output_csv_refined, index=False)
+print(f"Main clustering assignments with refined phenotypes saved as: {output_csv_refined}")
+
+# === REMOVE ARTEFACTS FROM ALL FURTHER ANALYSES ===
+artefact_mask = normalized_data["RefinedPhenotype"].eq("Artefact")
+n_artefact = int(artefact_mask.sum())
+normalized_data = normalized_data.loc[~artefact_mask].copy()
+print(f"🔍 Removed {n_artefact} cells labeled as 'Artefact' from downstream analysis.")
+
+# -----------------------------
+# L. UMAP colored by RefinedPhenotype
+# -----------------------------
+
+umap_refined_path = os.path.join(outdir, "UMAP_RefinedPhenotype.png")
+plt.figure(figsize=(12, 6))
+
+# palette dict ensures fixed colors per label
+refined_palette = {k: REFINED_COLORS[k] for k in ["Immune", "CAF", "Tumour", "Endothelial", "Other"]}
+
+ax = sns.scatterplot(
+    x='UMAP_main_1', y='UMAP_main_2',
+    hue='RefinedPhenotype', data=normalized_data,
+    palette=refined_palette, s=10, legend='full'
+)
+plt.title("UMAP Colored by RefinedPhenotype"); plt.xlabel("UMAP1"); plt.ylabel("UMAP2")
+handles, labels = ax.get_legend_handles_labels()
+ax.legend(handles=handles, labels=labels, title="RefinedPhenotype",
+          loc='center left', bbox_to_anchor=(1, 0.5), ncol=1)
+plt.tight_layout(rect=[0, 0, 0.75, 1])
+plt.savefig(umap_refined_path, dpi=300)
+plt.close()
+print(f"UMAP (RefinedPhenotype) saved as: {umap_refined_path}")
+
+
+# -----------------------------
+# M. OVERALL & PER-PATIENT STACKED BARS (Amendment #12)
+# -----------------------------
+overall_counts = normalized_data["RefinedPhenotype"].value_counts().reindex(REFINED_ORDER[:-1], fill_value=0)
+overall_percentages = overall_counts / overall_counts.sum() * 100
+defined_sum = overall_percentages.sum()
+overall_percentages["Undefined"] = 100 - defined_sum
+
+overall_df = pd.DataFrame([overall_percentages.reindex(REFINED_ORDER).values],
+                          columns=REFINED_ORDER, index=["Overall"])
+
+plt.figure(figsize=(6, 8))
+overall_df.plot(kind='bar', stacked=True,
+                color=[REFINED_COLORS[k] for k in REFINED_ORDER], edgecolor='none')
+plt.xlabel("Overall"); plt.ylabel("Proportion (%)"); plt.title("Overall Proportion of Each Refined Cell Type")
+overall_bar_path = os.path.join(outdir, "Stacked_Bar_Overall_Cell_Type_Proportions.png")
+plt.savefig(overall_bar_path, dpi=300); plt.close()
+print(f"Overall stacked bar chart saved as: {overall_bar_path}")
+
+prop_df = normalized_data.groupby(["Spot Id 1", "RefinedPhenotype"]).size().unstack(fill_value=0)
+prop_df = prop_df.div(prop_df.sum(axis=1), axis=0) * 100
+defined_pct = prop_df.reindex(columns=REFINED_ORDER[:-1], fill_value=0).sum(axis=1)
+prop_df["Undefined"] = 100 - defined_pct
+prop_df = prop_df.reindex(columns=REFINED_ORDER, fill_value=0)
+
+plt.figure(figsize=(12, 8))
+prop_df.plot(kind='bar', stacked=True,
+             color=[REFINED_COLORS[k] for k in REFINED_ORDER], edgecolor='none')
+plt.xlabel("Patient (Spot Id 1)"); plt.ylabel("Proportion (%)")
+plt.title("Proportion of Each Refined Cell Type per Patient")
+patient_bar_path = os.path.join(outdir, "Stacked_Bar_Proportion_Cell_Types_per_Patient.png")
+plt.savefig(patient_bar_path, dpi=300); plt.close()
+print(f"Patient-level stacked bar chart saved as: {patient_bar_path}")
+
+# -----------------------------
+# N. SPATIAL PLOTS PER TMA
+# -----------------------------
+refined_color_map = {k: REFINED_COLORS[k] for k in REFINED_COLORS if k != "Undefined"}
+unique_tma = normalized_data["Spot Id 2"].unique()
+for tma in unique_tma:
+    tma_subset = normalized_data[normalized_data["Spot Id 2"] == tma]
+    if tma_subset.empty: 
+        continue
+    tma_subset = tma_subset.copy()
+    tma_subset["Color"] = tma_subset["RefinedPhenotype"].apply(lambda x: refined_color_map.get(x, "gray"))
+    patient_ids = tma_subset["Spot Id 1"].unique()
+    title = f"TMA (Spot Id 2): {tma} | Patient(s): {', '.join(patient_ids.astype(str).tolist())}"
+    plt.figure(figsize=(8, 6))
+    plt.scatter(tma_subset["X"], tma_subset["Y"], c=tma_subset["Color"], s=10, alpha=0.8)
+    plt.title(title); plt.xlabel("X coordinate"); plt.ylabel("Y coordinate")
+    plt.tight_layout()
+    fname = f"TMA_{tma}_Coordinates.png"
+    plt.savefig(os.path.join(outdir, fname), dpi=300); plt.close()
+    print(f"Saved scatter plot for TMA {tma} as {fname}")
+
+# -----------------------------
+# O. SUBCLUSTERING (Tumour=CAIX-only; safe PCs & guards)
+# -----------------------------
+# Ensure output columns exist
+for col in [
+    "Tumour_Subcluster", "UMAP_Tumour_Sub_1", "UMAP_Tumour_Sub_2",
+    "Immune_Subcluster", "UMAP_Immune_Sub_1", "UMAP_Immune_Sub_2",
+    "CAF_Subcluster",    "UMAP_CAF_Sub_1",    "UMAP_CAF_Sub_2"
+]:
+    if col not in normalized_data.columns:
+        normalized_data[col] = np.nan
+
+# --- Tumour subclustering: CAIX only, no-PCA path when n_features==1 ---
+sub_markers_tumour = ["CAIX"]
+
+tumour_cells = normalized_data[normalized_data["RefinedPhenotype"] == "Tumour"]
+if tumour_cells.shape[0] > 2:
+    have_markers = [m for m in sub_markers_tumour if m in tumour_cells.columns]
+    if len(have_markers) == 1:
+        caix = pd.to_numeric(tumour_cells[have_markers[0]], errors="coerce")
+        if np.isfinite(caix).sum() >= 3 and caix.std(ddof=0) > 0:
+            adata_tumour = sc.AnnData(
+                tumour_cells[have_markers].values.astype(float),
+                obs=pd.DataFrame(index=tumour_cells["CellID"].astype(str)),
+                var=pd.DataFrame(index=have_markers)
+            )
+            sc.pp.scale(adata_tumour, zero_center=True, max_value=10)
+
+            nn = int(max(2, min(15, adata_tumour.n_obs - 1)))
+            if adata_tumour.n_vars == 1:
+                # <-- KEY: skip PCA; use raw (scaled) X for neighbors
+                sc.pp.neighbors(adata_tumour, n_neighbors=nn, use_rep="X")
+            else:
+                sc.tl.pca(adata_tumour, svd_solver='auto')
+                sc.pp.neighbors(adata_tumour, n_neighbors=nn, n_pcs=1)
+
+            sc.tl.leiden(adata_tumour, resolution=0.01, flavor="igraph", n_iterations=2, directed=False)
+            sc.tl.umap(adata_tumour, random_state=42)
+
+            normalized_data.loc[adata_tumour.obs_names, "Tumour_Subcluster"] = adata_tumour.obs["leiden"].astype(int).values
+            normalized_data.loc[adata_tumour.obs_names, "UMAP_Tumour_Sub_1"] = adata_tumour.obsm["X_umap"][:, 0]
+            normalized_data.loc[adata_tumour.obs_names, "UMAP_Tumour_Sub_2"] = adata_tumour.obsm["X_umap"][:, 1]
+            print("Tumour subclustering completed on CAIX (single-marker, no-PCA).")
+        else:
+            print("Skipping tumour subclustering: CAIX has zero/near-zero variance or insufficient finite values.")
+    else:
+        print("Skipping tumour subclustering: CAIX marker not found in dataframe.")
+else:
+    print("Skipping tumour subclustering: fewer than 3 tumour cells.")
+
+# --- Immune subclustering (unchanged logic) ---
+immune_cells = normalized_data[normalized_data["RefinedPhenotype"] == "Immune"]
+if immune_cells.shape[0] > 1:
+    adata_immune = sc.AnnData(
+        immune_cells[sub_markers_immune].values,
+        obs=pd.DataFrame(index=immune_cells["CellID"].astype(str)),
+        var=pd.DataFrame(index=sub_markers_immune)
+    )
+    sc.pp.scale(adata_immune, zero_center=True, max_value=10)
+    sc.tl.pca(adata_immune, svd_solver='arpack')
+    sc.pp.neighbors(adata_immune, n_neighbors=15, n_pcs=safe_npcs(adata_immune))
+    sc.tl.leiden(adata_immune, resolution=1.0, flavor="igraph", n_iterations=2, directed=False)
+    sc.tl.umap(adata_immune)
+
+    normalized_data.loc[adata_immune.obs_names, "Immune_Subcluster"]     = adata_immune.obs["leiden"].astype(int).values
+    normalized_data.loc[adata_immune.obs_names, "UMAP_Immune_Sub_1"]     = adata_immune.obsm["X_umap"][:, 0]
+    normalized_data.loc[adata_immune.obs_names, "UMAP_Immune_Sub_2"]     = adata_immune.obsm["X_umap"][:, 1]
+    print("Immune subclustering completed.")
+
+# --- CAF subclustering (unchanged logic) ---
+caf_cells = normalized_data[normalized_data["RefinedPhenotype"] == "CAF"]
+if caf_cells.shape[0] > 1:
+    adata_caf = sc.AnnData(
+        caf_cells[sub_markers_caf].values,
+        obs=pd.DataFrame(index=caf_cells["CellID"].astype(str)),
+        var=pd.DataFrame(index=sub_markers_caf)
+    )
+    sc.pp.scale(adata_caf, zero_center=True, max_value=10)
+    sc.tl.pca(adata_caf, svd_solver='arpack')
+    sc.pp.neighbors(adata_caf, n_neighbors=15, n_pcs=safe_npcs(adata_caf))
+    sc.tl.leiden(adata_caf, resolution=0.3, flavor="igraph", n_iterations=2, directed=False)
+    sc.tl.umap(adata_caf)
+
+    normalized_data.loc[adata_caf.obs_names, "CAF_Subcluster"]           = adata_caf.obs["leiden"].astype(int).values
+    normalized_data.loc[adata_caf.obs_names, "UMAP_CAF_Sub_1"]           = adata_caf.obsm["X_umap"][:, 0]
+    normalized_data.loc[adata_caf.obs_names, "UMAP_CAF_Sub_2"]           = adata_caf.obsm["X_umap"][:, 1]
+    print("CAF subclustering completed.")
+
+# -----------------------------
+# P. SUBCLUSTER HEATMAPS (consistent with MainCluster style)
+# -----------------------------
+def plot_subcluster_heatmaps(df, cluster_col, markers, label, outdir, clusters_per_page=15):
+    # nothing to plot?
+    if df[cluster_col].notna().sum() == 0:
+        print(f"No {label} subcluster assignments to plot.")
+        return
+
+    # Mean per subcluster
+    means = df.groupby(cluster_col)[markers].mean()
+
+    # Z-score per marker (column-wise) with ±2 cap; avoid div/0 if std = 0
+    def zscore_col(col):
+        sd = col.std(ddof=0)
+        if sd == 0 or np.isnan(sd):
+            return (col - col.mean())  # will be all zeros
+        return (col - col.mean()) / sd
+    z = means.apply(zscore_col, axis=0).clip(-2, 2)
+
+    # Paginate
+    n_clusters = z.shape[0]
+    n_pages = math.ceil(n_clusters / clusters_per_page)
+    for page in range(n_pages):
+        start = page * clusters_per_page
+        end = min(start + clusters_per_page, n_clusters)
+        z_subset = z.iloc[start:end]
+
+        plt.figure(figsize=(12, max(6, 0.6 * (end - start))))
+        sns.heatmap(
+            z_subset,
+            cmap="RdBu_r",
+            center=0,
+            annot=True, fmt=".2f",
+            linewidths=0.5, linecolor='gray',
+            cbar_kws={'label': 'Z-score (±2 cap)'}
+        )
+        plt.xticks(rotation=45, ha='right', fontsize=9)
+        plt.yticks(fontsize=9)
+        plt.xlabel("Markers", fontsize=11, fontweight='bold')
+        plt.ylabel(f"{label} Subcluster", fontsize=11, fontweight='bold')
+        plt.title(f"{label} Subcluster Marker Expression (Z-score)\nClusters {start}–{end-1}",
+                  fontsize=13, fontweight='bold')
+        plt.tight_layout()
+
+        out_path = os.path.join(outdir, f"{label}_Subcluster_Heatmap_Zscore_{start}_to_{end-1}.png")
+        plt.savefig(out_path, dpi=300)
+        plt.close()
+        print(f"{label} subcluster heatmap page saved: {out_path}")
+
+# Tumour
+plot_subcluster_heatmaps(
+    df=normalized_data[normalized_data["Tumour_Subcluster"].notna()],
+    cluster_col="Tumour_Subcluster",
+    markers=sub_markers_tumour,
+    label="Tumour",
+    outdir=outdir,
+    clusters_per_page=15
+)
+
+# Immune
+plot_subcluster_heatmaps(
+    df=normalized_data[normalized_data["Immune_Subcluster"].notna()],
+    cluster_col="Immune_Subcluster",
+    markers=sub_markers_immune,
+    label="Immune",
+    outdir=outdir,
+    clusters_per_page=15
+)
+
+# CAF
+plot_subcluster_heatmaps(
+    df=normalized_data[normalized_data["CAF_Subcluster"].notna()],
+    cluster_col="CAF_Subcluster",
+    markers=sub_markers_caf,
+    label="CAF",
+    outdir=outdir,
+    clusters_per_page=15
+)
+
+# -----------------------------
+# Q. MANUAL LABEL MAPS (unchanged from your code)
+# -----------------------------
+tumour_subcluster_mapping = {
+    0: "Hypoxic", 1: "Hypoxic", 2: "Hypoxic", 3: "Hypoxic", 4: "Hypoxic", 
+    5: "", 6: "Hypoxic", 7: "Hypoxic", 8: "Hypoxic", 9: "Hypoxic",
+    10: "Hypoxic", 11: "Hypoxic", 12: "Normoxic", 13: "Hypoxic", 14: "Hypoxic",
+    15: "Hypoxic", 16: "Hypoxic", 17: "Hypoxic", 18: "Hypoxic", 19: "Hypoxic",
+    20: "Hypoxic", 21: "", 22: "Hypoxic", 23: "Hypoxic", 24: "Hypoxic",
+    25: "Hypoxic", 26: "Normoxic", 27: "Hypoxic", 28: "Hypoxic", 29: "Hypoxic",
+    30: "Hypoxic", 31: "Hypoxic", 32: "Hypoxic", 33: "Hypoxic", 34: "Hypoxic",
+    35: "Hypoxic", 36: "Hypoxic", 37: "Hypoxic", 38: "Hypoxic", 39: "Normoxic",
+    40: "Hypoxic", 41: "Hypoxic", 42: "Hypoxic", 43: "Hypoxic", 44: "Hypoxic",
+    45: "Hypoxic", 46: "Hypoxic", 47: "Hypoxic", 48: "Hypoxic", 49: "Normoxic",
+    50: "Hypoxic", 51: "Normoxic", 52: "Hypoxic", 53: "Hypoxic", 54: "Normoxic",
+    55: "Normoxic", 56: "Normoxic", 57: "Normoxic", 58: "Normoxic", 59: "Normoxic",
+    60: "Normoxic", 61: "Normoxic", 62: "Normoxic", 63: "Normoxic", 64: "Normoxic",
+    65: "Normoxic", 66: "Normoxic", 67: "Normoxic", 68: "Normoxic", 69: "Normoxic",
+    70: "Normoxic", 71: "Normoxic", 72: "Normoxic", 73: "Normoxic", 74: "Normoxic",
+    75: "Normoxic", 76: "Normoxic", 77: "Normoxic", 78: "Normoxic", 79: "Normoxic",
+    80: "Normoxic", 81: "Hypoxic", 82: "Normoxic", 83: "Normoxic", 84: "Normoxic",
+    85: "Normoxic", 86: "Normoxic", 87: "Normoxic", 88: "Normoxic", 89: "Normoxic",
+    90: "Normoxic", 91: "Normoxic", 92: "Normoxic", 93: "Normoxic", 94: "Normoxic",
+    95: "Normoxic", 96: "Normoxic", 97: "Normoxic", 98: "Normoxic", 99: "Hypoxic",
+    100: "Hypoxic", 101: "Normoxic", 102: "Normoxic", 103: "Normoxic", 104: "Hypoxic",
+    105: "Normoxic", 106: "Hypoxic", 107: "Normoxic", 108: "Hypoxic", 109: "Normoxic",
+    110: "Hypoxic", 111: "Normoxic", 112: "Normoxic", 113: "Hypoxic", 114: "Normoxic",
+    115: "Hypoxic", 116: "Hypoxic", 117: "Normoxic", 118: "Normoxic", 119: "Normoxic",
+    120: "Hypoxic", 121: "Normoxic", 122: "Normoxic", 123: "Normoxic", 124: "Normoxic",
+    125: "Normoxic", 126: "Normoxic", 127: "Hypoxic", 128: "Normoxic", 129: "Normoxic",
+    130: "Normoxic", 131: "Normoxic", 132: "Hypoxic", 133: "Hypoxic", 134: "Normoxic",
+    135: "Normoxic", 136: "Hypoxic", 137: "Normoxic", 138: "Hypoxic", 139: "Hypoxic",
+    140: "Normoxic", 141: "Normoxic", 142: "Normoxic", 143: "Hypoxic", 144: "Hypoxic",
+    145: "Normoxic", 146: "Hypoxic", 147: "Hypoxic", 148: "Normoxic", 149: "Normoxic",
+    150: "Normoxic", 151: "Normoxic", 152: "Normoxic", 153: "Normoxic", 154: "Hypoxic",
+    155: "Normoxic", 156: "Hypoxic", 157: "Hypoxic", 158: "Normoxic", 159: "Normoxic",
+    160: "Hypoxic", 161: "Hypoxic", 162: "Normoxic", 163: "Normoxic", 164: "Hypoxic",
+    165: "Normoxic", 166: "Hypoxic", 167: "Hypoxic", 168: "Hypoxic", 169: "Normoxic",
+    170: "Hypoxic", 171: "Hypoxic", 172: "Hypoxic", 173: "Hypoxic", 174: "Hypoxic",
+    175: "Hypoxic", 176: "Normoxic", 177: "Hypoxic", 178: "Normoxic", 179: "Hypoxic",
+    180: "Hypoxic", 181: "Normoxic", 182: "Hypoxic", 183: "Hypoxic", 184: "Normoxic",
+    185: "Hypoxic", 186: "Hypoxic", 187: "Hypoxic", 188: "Hypoxic", 189: "Normoxic",
+    190: "Normoxic", 191: "Normoxic", 192: "Hypoxic", 193: "Normoxic", 194: "Normoxic",
+    195: "Hypoxic", 196: "Normoxic", 197: "Hypoxic", 198: "Normoxic", 199: "Hypoxic",
+    200: "Normoxic", 201: "Hypoxic", 202: "Hypoxic", 203: "Hypoxic", 204: "Normoxic",
+    205: "Hypoxic", 206: "Hypoxic", 207: "Hypoxic", 208: "Normoxic", 209: "Normoxic",
+    210: "Hypoxic", 211: "Hypoxic", 212: "Hypoxic"
+}
+
+caf_subcluster_mapping = {
+    0: "Subtype C", 1: "Triple negative", 2: "Subtype C", 3: "Triple negative",
+    4: "Artefact", 5: "Triple negative", 6: "Subtype C", 7: "Subtype B",
+    8: "Subtype B", 9: "Subtype B", 10: "Subtype B", 11: "Subtype B",
+    12: "Triple negative", 13: "Subtype A", 14: "Artefact", 15: "Artefact",
+    16: "Subtype A", 17: "Subtype A", 18: "Subtype A", 19: "Triple negative",
+    20: "Subtype A", 21: "Artefact", 22: "Artefact", 23: "Artefact",
+    24: "Artefact", 25: "Artefact", 26: "Artefact", 27: "Artefact",
+    28: "Artefact", 29: "Artefact",
+}
+
+Immune_Subcluster_mapping = {
+    0: "CD8", 1: "CD4", 2: "APC", 3: "CD8",
+    4: "CD8", 5: "Macrophage", 6: "Macrophage", 7: "Other Immune", 8: "CD4",
+    9: "B Cell", 10: "Other Immune", 11: "Macrophage", 12: "Macrophage",
+    13: "APC", 14: "B Cell", 15: "Other Immune", 16: "Other Immune", 17: "CD8",
+    18: "CD4", 19: "Other Immune", 20: "CD8", 21: "CD4", 22: "CD8",
+    23: "CD4", 24: "B Cell", 25: "CD4", 26: "Artefact",
+    27: "Artefact", 28: "B Cell", 29: "Artefact", 30: "Macrophage",
+    31: "Artefact", 32: "Artefact", 33: "Artefact"
+}
+
+normalized_data["Tumour_Subcluster_Label"] = normalized_data["Tumour_Subcluster"].map(tumour_subcluster_mapping)
+normalized_data["CAF_Subcluster_Label"] = normalized_data["CAF_Subcluster"].map(caf_subcluster_mapping)
+normalized_data["Immune_Subcluster_Label"] = normalized_data["Immune_Subcluster"].map(Immune_Subcluster_mapping)
+
+# -----------------------------
+# R. MAIN IMMUNE TYPES BARS (Amendment #3: "APC" vs "pAPC")
+# -----------------------------
+immune_cells_only = normalized_data[normalized_data["RefinedPhenotype"] == "Immune"].copy()
+desired_order = ["CD4", "CD8", "B Cell", "Macrophage", "APC", "Other Immune"]  # "APC" (not "pAPC")
+
+overall_counts_immune = immune_cells_only["Immune_Subcluster_Label"].value_counts().reindex(desired_order, fill_value=0)
+overall_percentages_immune = overall_counts_immune / overall_counts_immune.sum() * 100
+overall_immune_df = pd.DataFrame([overall_percentages_immune.values], columns=desired_order, index=["Overall"])
+
+plt.figure(figsize=(6, 6))
+overall_immune_df.plot(kind="bar", stacked=True, legend=True,
+                       color=["#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3", "#a6d854", "#808080"])
+plt.xlabel("Overall"); plt.ylabel("Proportion (%)"); plt.title("Overall Proportion of Main Immune Cell Types")
+overall_immune_path = os.path.join(outdir, "Stacked_Bar_Overall_Immune_Types.png")
+plt.savefig(overall_immune_path, dpi=300); plt.close()
+print(f"Overall immune stacked bar chart saved as: {overall_immune_path}")
+
+per_patient_counts = immune_cells_only.groupby(["Spot Id 1", "Immune_Subcluster_Label"]).size().unstack(fill_value=0)
+per_patient_counts = per_patient_counts.reindex(columns=desired_order, fill_value=0)
+per_patient_percentages = per_patient_counts.div(per_patient_counts.sum(axis=1), axis=0) * 100
+plt.figure(figsize=(12, 8))
+per_patient_percentages.plot(kind="bar", stacked=True, legend=True,
+                             color=["#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3", "#a6d854", "#808080"])
+plt.xlabel("Patient (Spot Id 1)"); plt.ylabel("Proportion (%)"); plt.title("Per-Patient Proportion of Main Immune Cell Types")
+per_patient_immune_path = os.path.join(outdir, "Stacked_Bar_PerPatient_Immune_Types.png")
+plt.savefig(per_patient_immune_path, dpi=300); plt.close()
+print(f"Per-patient immune stacked bar chart saved as: {per_patient_immune_path}")
+
+# -----------------------------
+# S. IMMUNE SUB-SUBCLUSTERING  (single-marker aware, Z-score heatmaps, safe PCs)
+# -----------------------------
+
+def subcluster_immune_subtype(df, subtype_name, subtype_markers, outdir, resolution=0.2):
+    """
+    Immune sub-subclustering within a given immune subtype (e.g., CD4, CD8, B Cell, Macrophage).
+
+    - Supports single-marker panels:
+        * If n_features == 1: skip PCA, build neighbors directly on scaled X (use_rep="X").
+        * Else: scale -> PCA -> neighbors with safe_npcs.
+    - Produces:
+        * Z-score (per-marker) heatmap of sub-subcluster means (±2 cap; centered at 0; RdBu_r)
+        * UMAP scatter colored by sub-subcluster ID
+    - Skips gracefully if too few cells or zero variance.
+    """
+    subset = df[df["Immune_Subcluster_Label"] == subtype_name].copy()
+    # Need enough cells to form a graph; allow ≥1 marker
+    if subset.shape[0] < 3 or len(subtype_markers) < 1:
+        print(f"Skipping {subtype_name}: cells={subset.shape[0]}, markers={len(subtype_markers)} (need ≥3 cells & ≥1 marker).")
+        return
+
+    have = [m for m in subtype_markers if m in subset.columns]
+    if len(have) < 1:
+        print(f"Skipping {subtype_name}: none of the requested markers present.")
+        return
+
+    X = subset[have].astype(float).values
+    adata = sc.AnnData(
+        X,
+        obs=pd.DataFrame(index=subset.index.astype(str)),
+        var=pd.DataFrame(index=have)
+    )
+
+    try:
+        sc.pp.scale(adata, zero_center=True, max_value=10)
+        nn = int(max(2, min(15, adata.n_obs - 1)))
+
+        if adata.n_vars == 1:
+            # Single-marker path: require finite variability; skip PCA
+            if not np.isfinite(adata.X).all() or float(np.std(adata.X)) == 0.0:
+                print(f"Skipping {subtype_name}: single marker has zero/near-zero variance.")
+                return
+            sc.pp.neighbors(adata, n_neighbors=nn, use_rep="X")
+        else:
+            sc.tl.pca(adata, svd_solver='auto')
+            sc.pp.neighbors(adata, n_neighbors=nn, n_pcs=safe_npcs(adata))
+
+        sc.tl.leiden(adata, resolution=resolution, flavor="igraph", n_iterations=2, directed=False)
+        sc.tl.umap(adata, random_state=42)
+
+        cluster_col = f"{subtype_name}_SubSubCluster"
+        umap_col1   = f"UMAP_{subtype_name}_1"
+        umap_col2   = f"UMAP_{subtype_name}_2"
+
+        # Write back assignments & UMAP
+        df.loc[adata.obs_names, cluster_col] = adata.obs["leiden"].astype(int).values
+        df.loc[adata.obs_names, umap_col1]   = adata.obsm["X_umap"][:, 0]
+        df.loc[adata.obs_names, umap_col2]   = adata.obsm["X_umap"][:, 1]
+
+        # ---- Z-score (per-marker) heatmap of sub-subcluster means ----
+        sub_subset = df.loc[adata.obs_names]
+        aggregated = sub_subset.groupby(cluster_col)[have].mean()
+
+        def _zscore_cols(m):
+            def zcol(col):
+                sd = col.std(ddof=0)
+                if not np.isfinite(sd) or sd == 0:
+                    return (col - col.mean()) * 0  # neutral if no variance
+                return (col - col.mean()) / sd
+            return m.apply(zcol, axis=0).clip(-2, 2)
+
+        z = _zscore_cols(aggregated)
+
+        plt.figure(figsize=(max(8, 1.8 + 0.6 * len(have)),
+                            max(5, 1.8 + 0.6 * z.shape[0])))
+        sns.heatmap(
+            z, cmap="RdBu_r", center=0, annot=True, fmt=".2f",
+            linewidths=0.5, linecolor="gray",
+            cbar_kws={'label': 'Marker Z-score (±2 cap)'}
+        )
+        plt.xticks(rotation=45, ha='right')
+        plt.xlabel("Markers")
+        plt.ylabel(f"{subtype_name} Sub-Subcluster")
+        plt.title(f"{subtype_name} Sub-Subcluster Marker Expression (Z-score)")
+        plt.tight_layout()
+        heatmap_path = os.path.join(outdir, f"Heatmap_{subtype_name}_SubSubclusters_Zscore.png")
+        plt.savefig(heatmap_path, dpi=300)
+        plt.close()
+        print(f"Z-score heatmap for {subtype_name} saved: {heatmap_path}")
+
+        # ---- UMAP ----
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x=umap_col1, y=umap_col2, hue=cluster_col,
+                        data=sub_subset, palette="tab10", s=10, legend="full")
+        plt.title(f"{subtype_name} Sub-Subcluster UMAP")
+        plt.xlabel("UMAP1"); plt.ylabel("UMAP2")
+        plt.legend(title=f"{subtype_name} Sub-Subcluster", bbox_to_anchor=(1, 0.5))
+        plt.tight_layout()
+        umap_path = os.path.join(outdir, f"UMAP_{subtype_name}_SubSubclusters.png")
+        plt.savefig(umap_path, dpi=300); plt.close()
+        print(f"UMAP for {subtype_name} saved: {umap_path}")
+
+        n_clusters = len(np.unique(adata.obs['leiden']))
+        print(f"For {subtype_name} sub-subclustering, there are {n_clusters} clusters.")
+
+    except Exception as e:
+        print(f"Sub-subclustering failed for {subtype_name}: {e}. Assigning a single cluster (0).")
+        cluster_col = f"{subtype_name}_SubSubCluster"
+        umap_col1   = f"UMAP_{subtype_name}_1"
+        umap_col2   = f"UMAP_{subtype_name}_2"
+        df.loc[subset.index, cluster_col] = 0
+        df.loc[subset.index, [umap_col1, umap_col2]] = np.nan
+
+# ---- Marker sets for immune sub-subclustering ----
+cd4_markers   = ["FOXP3", "GRZB", "LAG3", "CD107a", "PD1"]
+cd8_markers   = ["PD1", "LAG3", "GRZB", "CD107a"]
+bcell_markers = ["BCL-6", "MHCII", "PD1", "CD21"]
+macro_markers = ["MHCII"]  # single-marker macrophage panel
+
+# ---- Run sub-subclustering ----
+# Tune resolutions as needed (lower → fewer, larger clusters)
+subcluster_immune_subtype(normalized_data, "CD4",        cd4_markers,   outdir, resolution=1.0)
+subcluster_immune_subtype(normalized_data, "CD8",        cd8_markers,   outdir, resolution=1.0)
+subcluster_immune_subtype(normalized_data, "B Cell",     bcell_markers, outdir, resolution=0.5)
+subcluster_immune_subtype(normalized_data, "Macrophage", macro_markers, outdir, resolution=0.01)
+
+# -----------------------------
+# T. IMMUNE SUB-SUBCLUSTER LABELS (unchanged for 4 major types)
+# -----------------------------
+bcell_cluster_labels = {
+    0:'B Cell', 1:'B Cell FDR+', 2:'B Cell', 3:'B Cell', 4:'B Cell', 5:'B Cell FDR+',
+    6:'B Cell', 7:'B Cell FDR+', 8:' Cell', 9:'B Cell', 10:' Cell', 11:'B Cell',
+    12:'B Cell', 13:'B Cell', 14:'B Cell', 15:'Artefact', 16:'B Cell FDR+', 
+    17:'B Cell FDR+', 18:'B Cell', 19:'B Cell'
+}
+
+macrophage_cluster_labels = {
+    0: "M2", 1: "M2", 2: "M2", 3: "M2", 4: "M2", 5: "M2", 6: "M2", 7: "M2", 8: "M2", 9: "M2",
+    10: "M2", 11: "M2", 12: "M2", 13: "M2", 14: "M2", 15: "M2", 16: "M2", 17: "M2", 18: "M2",
+    19: "M2", 20: "M2", 21: "M2", 22: "M2", 23: "M2", 24: "M2", 25: "M2", 26: "M2", 27: "M2", 
+    28: "M2", 29: "M2", 30: "M2", 31: "M2", 32: "M2", 33: "M1", 34: "M2", 35: "M2", 36: "M1", 
+    37: "M2", 38: "M1", 39: "M2", 40: "M2", 41: "M2", 42: "M2", 43: "M2", 44: "M2", 45: "M2", 
+    46: "M2", 47: "M2", 48: "M2", 49: "M2", 50: "M2", 51: "M2", 52: "M2", 53: "M1", 54: "M2", 
+    55: "M1", 56: "M2", 57: "M2", 58: "M2", 59: "M1", 60: "M2", 61: "M2", 62: "M2", 63: "M2", 
+    64: "M2", 65: "M2", 66: "M1", 67: "M1", 68: "M2", 69: "M2", 70: "M2", 71: "M1", 72: "M2", 
+    73: "M1", 74: "M2", 75: "M1", 76: "M1", 77: "M1", 78: "M1", 79: "M2", 80: "M2", 81: "M2", 
+    82: "M1", 83: "M1", 84: "M1", 85: "M2", 86: "M2", 87: "M1"
+}
+
+cd4_cluster_labels = {
+    0:  'CD4 Conventional', 1:  'CD4 Conventional', 2:  'Treg',             3:  'CD4 Conventional',
+    4:  'CD4 Conventional', 5:  'CD4 Conventional', 6:  'CD4 Conventional', 7:  'CD4 Conventional', 
+    8:  'CD4 Conventional', 9:  'CD4 Conventional', 10: 'CD4 Conventional', 11: 'Treg',             
+    12: 'CD4 Conventional', 13: 'CD4 Conventional', 14: 'CD4 Conventional', 15: 'Treg',
+    16: 'CD4 Conventional', 17: 'Treg',             18: 'CD4 Conventional', 19: 'CD4 Conventional', 
+    20: 'CD4 Conventional', 21: 'CD4 Conventional', 22: 'CD4 Conventional', 23: 'CD4 Conventional',
+    24: 'CD4 Conventional', 25: 'CD4 Conventional', 26: 'CD4 Conventional', 27: 'CD4 Conventional',
+    28: 'CD4 Conventional', 29: 'CD4 Conventional', 30: 'CD4 Conventional', 31: 'CD4 Conventional',
+    32: 'CD4 Conventional', 33: 'CD4 Conventional', 34: 'CD4 Conventional'
+}
+
+cd8_cluster_labels = {
+    0:  'CD8 Bystander',  1:  'CD8 Bystander',  2:  'CD8 Bystander',   3:  'CD8 Bystander',
+    4:  'CD8 Bystander',  5:  'CD8 AE',         6:  'CD8 Cytotoxic',   7:  'CD8 AE',
+    8:  'CD8 Exhausted',  9:  'CD8 Cytotoxic',  10: 'CD8 Cytotoxic',   11: 'CD8 AE',
+    12: 'CD8 Exhausted', 13: 'CD8 Bystander',   14: 'CD8 Bystander',   15: 'CD8 AE',
+    16: 'CD8 Bystander', 17: 'CD8 Exhausted',   18: 'CD8 Bystander',   19: 'CD8 Bystander',
+    20: 'CD8 AE',        21: 'CD8 Bystander',   22: 'CD8 Bystander',   23: 'CD8 Bystander',
+    24: 'CD8 Exhausted', 25: 'CD8 Exhausted',   26: 'CD8 Exhausted',   27: 'CD8 AE',
+    28: 'CD8 Exhausted', 29: 'CD8 Cytotoxic',   30: 'CD8 AE',          31: 'CD8 Exhausted',
+    32: 'CD8 Bystander', 33: 'CD8 Cytotoxic',   34: 'CD8 Exhausted',   35: 'CD8 Exhausted',
+    36: 'CD8 Exhausted', 37: 'CD8 Cytotoxic',   38: 'CD8 Bystander',   39: 'CD8 AE',
+    40: 'CD8 Cytotoxic', 41: 'CD8 Cytotoxic',   42: 'CD8 AE',          43: 'CD8 AE',
+    44: 'CD8 Bystander', 45: 'CD8 Cytotoxic',   46: 'CD8 Exhausted'
+}
+
+# Attach labels (only for the types we actually sub-subcluster)
+normalized_data['Bcell_SubSubCluster_Label'] = (
+    normalized_data['B Cell_SubSubCluster'].map(bcell_cluster_labels)
+    if 'B Cell_SubSubCluster' in normalized_data.columns else np.nan
+)
+normalized_data['Macrophage_SubSubCluster_Label'] = (
+    normalized_data['Macrophage_SubSubCluster'].map(macrophage_cluster_labels)
+    if 'Macrophage_SubSubCluster' in normalized_data.columns else np.nan
+)
+normalized_data['CD4_SubSubCluster_Label'] = (
+    normalized_data['CD4_SubSubCluster'].map(cd4_cluster_labels)
+    if 'CD4_SubSubCluster' in normalized_data.columns else np.nan
+)
+normalized_data['CD8_SubSubCluster_Label'] = (
+    normalized_data['CD8_SubSubCluster'].map(cd8_cluster_labels)
+    if 'CD8_SubSubCluster' in normalized_data.columns else np.nan
+)
+
+# -----------------------------
+# U. STACKED BARS for subtype labels (unchanged; “Other Immune” has no sub-subclusters)
+# -----------------------------
+immune_subtypes = {
+    'CD4': 'CD4_SubSubCluster_Label',
+    'CD8': 'CD8_SubSubCluster_Label',
+    'B Cell': 'Bcell_SubSubCluster_Label',
+    'Macrophage': 'Macrophage_SubSubCluster_Label'
+}
+
+for cell_type, label_col in immune_subtypes.items():
+    subtype_df = normalized_data[normalized_data[label_col].notnull()].copy()
+    if subtype_df.empty:
+        print(f"No labeled sub-subclusters for {cell_type}; skipping plots.")
+        continue
+    overall_counts = subtype_df[label_col].value_counts()
+    overall_pct = (overall_counts / overall_counts.sum()) * 100
+
+    plt.figure(figsize=(8, 6))
+    overall_pct.plot(kind='bar', color=sns.color_palette('Set3'))
+    plt.title(f"Overall Proportion of {cell_type} Subtypes")
+    plt.ylabel("Proportion (%)"); plt.xlabel(f"{cell_type} Subtypes")
+    plt.xticks(rotation=45, ha='right'); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f"Stacked_Bar_Overall_{cell_type}_Subtypes.png"), dpi=300)
+    plt.close()
+
+    per_patient_counts = subtype_df.groupby(['Spot Id 1', label_col]).size().unstack(fill_value=0)
+    per_patient_pct = per_patient_counts.div(per_patient_counts.sum(axis=1), axis=0) * 100
+    per_patient_pct.plot(kind='bar', stacked=True, figsize=(12, 8), colormap='Set3')
+    plt.title(f"Per-Patient Proportion of {cell_type} Subtypes")
+    plt.ylabel("Proportion (%)"); plt.xlabel("Patient (Spot Id 1)")
+    plt.legend(title=f"{cell_type} Subtype", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f"Stacked_Bar_PerPatient_{cell_type}_Subtypes.png"), dpi=300)
+    plt.close()
+    print(f"Stacked bar charts for {cell_type} subtypes saved.")
+
+# -----------------------------
+# V. Final Immune Label (Amendment #4: remove dangling Other Immune sub-sub label)
+# -----------------------------
+def combine_immune_labels(row):
+    # Prefer detailed sub-subcluster labels (for CD4/CD8/B Cell/Macro)
+    for col in ["CD4_SubSubCluster_Label", "CD8_SubSubCluster_Label",
+                "Bcell_SubSubCluster_Label", "Macrophage_SubSubCluster_Label"]:
+        val = row.get(col)
+        if pd.notnull(val):
+            return val
+    # Else, fall back to the broad immune subcluster label (includes "Other Immune")
+    if pd.notnull(row.get("Immune_Subcluster_Label")):
+        return row.get("Immune_Subcluster_Label")
+    return "Unknown"
+
+normalized_data["Final_Immune_Label"] = normalized_data.apply(
+    lambda r: combine_immune_labels(r) if r["RefinedPhenotype"] == "Immune" else np.nan, axis=1
+)
+
+# -----------------------------
+# W. Immune UMAP colored by Final Immune Label
+# -----------------------------
+umap_refined_path = os.path.join(outdir, "UMAP_Immune_Refined.png")
+plt.figure(figsize=(8, 6))
+sns.scatterplot(x="UMAP_Immune_Sub_1", y="UMAP_Immune_Sub_2",
+                hue="Final_Immune_Label",
+                data=normalized_data[normalized_data["RefinedPhenotype"] == "Immune"],
+                palette="Set1", s=10, legend="full")
+plt.title("Immune UMAP (Post-labeling)"); plt.xlabel("UMAP1"); plt.ylabel("UMAP2")
+plt.legend(title="Final Immune Label", bbox_to_anchor=(1, 0.5))
+plt.tight_layout()
+plt.savefig(umap_refined_path, dpi=300); plt.close()
+print(f"Refined immune UMAP saved as: {umap_refined_path}")
+
+# -----------------------------
+# X. Final immune subtype bars
+# -----------------------------
+final_immune = normalized_data[normalized_data["RefinedPhenotype"] == "Immune"]
+if not final_immune.empty and final_immune["Final_Immune_Label"].notna().any():
+    overall_immune_counts = final_immune["Final_Immune_Label"].value_counts().sort_index()
+    overall_immune_percentages = overall_immune_counts / overall_immune_counts.sum() * 100
+    overall_immune_df = pd.DataFrame([overall_immune_percentages.values],
+                                     columns=overall_immune_percentages.index, index=["Overall"])
+    plt.figure(figsize=(6, 6))
+    overall_immune_df.plot(kind="bar", stacked=True, legend=True)
+    plt.xlabel("Overall"); plt.ylabel("Proportion (%)")
+    plt.title("Overall Proportion of Intricate Immune Cell Types")
+    immune_overall_bar_path = os.path.join(outdir, "Stacked_Bar_Overall_Immune_Subtypes.png")
+    plt.savefig(immune_overall_bar_path, dpi=300); plt.close()
+    print(f"Overall immune stacked bar chart saved as: {immune_overall_bar_path}")
+
+    per_patient_immune = final_immune.groupby(["Spot Id 1", "Final_Immune_Label"]).size().unstack(fill_value=0)
+    per_patient_immune = per_patient_immune.div(per_patient_immune.sum(axis=1), axis=0) * 100
+    plt.figure(figsize=(12, 6))
+    per_patient_immune.plot(kind="bar", stacked=True, legend=True)
+    plt.xlabel("Patient (Spot Id 1)"); plt.ylabel("Proportion (%)")
+    plt.title("Per-Patient Proportion of Intricate Immune Cell Types")
+    immune_patient_bar_path = os.path.join(outdir, "Stacked_Bar_PerPatient_Immune_Subtypes.png")
+    plt.savefig(immune_patient_bar_path, dpi=300); plt.close()
+    print(f"Per-patient immune stacked bar chart saved as: {immune_patient_bar_path}")
+else:
+    print("No final immune labels available to plot.")
+
+# -----------------------------
+# Y. FINAL PHENOTYPE COLUMNS & CSV
+# -----------------------------
+def assign_final_phenotype(row):
+    if row["RefinedPhenotype"] == "Tumour":
+        return row.get("Tumour_Subcluster_Label") if pd.notnull(row.get("Tumour_Subcluster_Label")) else "Tumour"
+    elif row["RefinedPhenotype"] == "CAF":
+        return row.get("CAF_Subcluster_Label") if pd.notnull(row.get("CAF_Subcluster_Label")) else "CAF"
+    elif row["RefinedPhenotype"] == "Immune":
+        return row.get("Final_Immune_Label") if pd.notnull(row.get("Final_Immune_Label")) else "Immune"
+    elif row["RefinedPhenotype"] == "Endothelial":
+        return "Endothelial"
+    elif row["RefinedPhenotype"] == "Other":
+        return "Other"
+    else:
+        return row["RefinedPhenotype"]
+
+normalized_data["Final_Phenotype"] = normalized_data.apply(assign_final_phenotype, axis=1)
+
+def get_detailed_phenotype(row):
+    if row["RefinedPhenotype"] == "Tumour":
+        return row.get("Tumour_Subcluster_Label", row["RefinedPhenotype"])
+    elif row["RefinedPhenotype"] == "CAF":
+        return row.get("CAF_Subcluster_Label", row["RefinedPhenotype"])
+    elif row["RefinedPhenotype"] == "Immune":
+        # Use broad immune type when no detailed label
+        if pd.notnull(row.get("Immune_Subcluster_Label")):
+            label = row.get("Immune_Subcluster_Label")
+            return label if label.lower() != "other immune" else "other immune"
+        else:
+            return row["RefinedPhenotype"]
+    elif row["RefinedPhenotype"] == "Endothelial":
+        return "Endothelial"
+    elif row["RefinedPhenotype"] == "Other":
+        return "Other"
+    else:
+        return "Other"
+
+normalized_data["Detailed_Phenotype"] = normalized_data.apply(get_detailed_phenotype, axis=1)
+
+# Cluster number columns
+normalized_data["MainCluster_Number"] = normalized_data["MainCluster"]
+
+def get_subcluster_number(row):
+    if pd.notnull(row.get("Tumour_Subcluster")):
+        return row.get("Tumour_Subcluster")
+    elif pd.notnull(row.get("CAF_Subcluster")):
+        return row.get("CAF_Subcluster")
+    elif pd.notnull(row.get("Immune_Subcluster")):
+        return row.get("Immune_Subcluster")
+    else:
+        return np.nan
+
+normalized_data["Subcluster_Number"] = normalized_data.apply(get_subcluster_number, axis=1)
+
+# Ensure sub-subcluster numeric columns exist
+for col in ["CD4_SubSubCluster", "CD8_SubSubCluster", "B Cell_SubSubCluster", "Macrophage_SubSubCluster"]:
+    if col not in normalized_data.columns:
+        normalized_data[col] = np.nan
+
+final_columns = ["CellID", "X", "Y", "Spot Id 1", "Spot Id 2",
+                 "MainCluster_Number", "Subcluster_Number",
+                 "CD4_SubSubCluster", "CD8_SubSubCluster", "B Cell_SubSubCluster", "Macrophage_SubSubCluster",
+                 "RefinedPhenotype", "Detailed_Phenotype", "Final_Phenotype"]
+
+final_df = normalized_data[final_columns].copy()
+final_df.rename(columns={"RefinedPhenotype": "Main_Cell_Type"}, inplace=True)
+
+output_csv_path = os.path.join(outdir, "Final_Cell_Phenotypes.csv")
+final_df.to_csv(output_csv_path, index=False)
+print(f"Final phenotype CSV saved as: {output_csv_path}")
+
+# Also save the full table if you need it later
+final_output_csv = os.path.join(outdir, "final_clustering_assignments.csv")
+normalized_data.to_csv(final_output_csv, index=False)
+print(f"Final clustering assignments saved as: {final_output_csv}")
